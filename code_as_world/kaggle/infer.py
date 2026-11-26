@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw
 from transformers import AutoModelForImageTextToText, LogitsProcessor, LogitsProcessorList, set_seed
 
 from code_as_world import evaluation as upstream
-from kaggle_quanti.artifacts import (
+from code_as_world.kaggle.artifacts import (
     blob, latest_attempt, parse_answer, read_json, reference, relative, require,
     resumable, write_json, write_jsonl, write_text,
 )
@@ -525,7 +525,7 @@ def run_worker(options):
 
 def file_budget_exhausted(run, options):
     import shutil
-    from kaggle_quanti.artifacts import file_bytes
+    from code_as_world.kaggle.artifacts import file_bytes
 
     reserve = 600 * 1024**2
     return shutil.disk_usage(run).free < reserve or file_bytes(run) > options["output_budget"] - reserve

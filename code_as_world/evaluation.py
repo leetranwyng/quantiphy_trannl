@@ -9,11 +9,6 @@ from pathlib import Path
 import re
 from typing import Any
 
-import numpy as np
-from jinja2 import Template
-from qwen_vl_utils.vision_process import fetch_video
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-from vllm import LLM, SamplingParams
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -223,6 +218,8 @@ def _load_csv(
 
 
 def _load_model_tools(model_path: Path):
+    from transformers import AutoProcessor, AutoTokenizer
+
     chat_template = CHAT_TEMPLATE.read_text(encoding="utf-8")
     kwargs = {"trust_remote_code": True, "use_fast": True}
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), **kwargs)
@@ -316,6 +313,8 @@ def _build_prompt_ids(
 
 
 def _process_video(video: str) -> tuple[Any, float]:
+    from qwen_vl_utils.vision_process import fetch_video
+
     if not video.startswith(("http://", "https://", "s3://", "file://")) and not os.path.isfile(video):
         raise FileNotFoundError(f"video not found: {video}")
     vision_info = {
@@ -417,6 +416,8 @@ def _build_inputs(
 
 
 def _ensure_vocab_size(model_path: Path) -> None:
+    from transformers import AutoConfig
+
     config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
     if hasattr(config, "vocab_size"):
         return
@@ -433,6 +434,8 @@ def _ensure_vocab_size(model_path: Path) -> None:
 
 
 def _build_engine(model: str, model_path: Path) -> LLM:
+    from vllm import LLM
+
     settings = MODEL_SETTINGS[model]
     _ensure_vocab_size(model_path)
     print(f"[eval] loading {model} from {model_path}", flush=True)
@@ -518,6 +521,8 @@ def _json_safe(value: Any) -> Any:
 
 
 def _percentile(values: list[int], percentile: int) -> float | None:
+    import numpy as np
+
     return float(np.percentile(values, percentile)) if values else None
 
 
@@ -566,6 +571,10 @@ def evaluate(
     out_json: Path,
     generations_log: Path,
 ) -> dict[str, Any]:
+    import numpy as np
+    from jinja2 import Template
+    from vllm import SamplingParams
+
     records, source_rows, output_columns = _load_csv(input_csv, video_dir, video_ext)
     format_prompt = Template(FORMAT_PROMPT.read_text(encoding="utf-8").strip())
     tokenizer, processor = _load_model_tools(model_path)

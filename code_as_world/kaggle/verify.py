@@ -18,14 +18,14 @@ from urllib.parse import unquote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
-if (HERE / "source" / "kaggle_quanti").is_dir():
+if (HERE / "source" / "code_as_world").is_dir():
     sys.path.insert(0, str(HERE / "source"))
 
-from kaggle_quanti.artifacts import (
+from code_as_world.kaggle.artifacts import (
     GROUPS, INTEGRITY, LABELS, check_reference, fingerprint, read_json, read_prediction_rows,
     relative, require, resolve, sample_id, score_rows,
 )
-from kaggle_quanti.artifacts import parse_answer
+from code_as_world.kaggle.artifacts import parse_answer
 
 
 class Links(HTMLParser):

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
-from kaggle_quanti.artifacts import (
+from code_as_world.kaggle.artifacts import (
     GROUPS, latest_attempt, parse_answer, read_json, relative, score_rows, wrap_links,
     write_json, write_jsonl, write_text,
 )

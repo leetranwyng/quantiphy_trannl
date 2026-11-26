@@ -19,14 +19,14 @@ import traceback
 from collections import Counter
 from pathlib import Path
 
-from kaggle_quanti.artifacts import (
+from code_as_world.kaggle.artifacts import (
     GROUPS, SCHEMA, choose_sanity, copy_file, file_bytes, fingerprint, latest_attempt, load_dataset,
     read_json, reference, require, resumable, seal, sha256, split_by_video, write_json, write_text,
 )
-from kaggle_quanti.report import publish
+from code_as_world.kaggle.report import publish
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 LOCK = read_json(Path(__file__).with_name("snapshots.json"))
 GIB = 1024**3
 ARCHIVES = {"sanity": "quantiphy_sanity.tar", "full": "quantiphy_full.tar", "merge": "quantiphy_merged.tar"}
@@ -128,8 +128,8 @@ def snapshot_source(run, benchmark, model):
     source = run / "source"
     require(not run_command("git", "status", "--porcelain", "--untracked-files=no"), "Checkout has uncommitted source changes")
     tracked = (
-        "LICENSE", "README.md", "code_as_world", "kaggle_quanti",
-        "quantiphy_caw_sanity_t4.ipynb", "quantiphy_caw_full_t4.ipynb",
+        "LICENSE", "README.md", "code_as_world",
+        "notebooks",
     )
     listed = run_command("git", "ls-files", "-z", "--", *tracked)
     for name in listed.split("\0"):
@@ -208,7 +208,7 @@ def launch(run, work, specs, mode, profile, devices, model_path, identity, deep,
         log_path = folder / "worker.log"
         if log_path.exists():
             log_path.rename(folder / f"worker-{time.time_ns()}.log")
-        cmd = [sys.executable, "-m", "kaggle_quanti.infer", str(work_item)]
+        cmd = [sys.executable, "-m", "code_as_world.kaggle.infer", str(work_item)]
         write_json(folder / "launch.json", {"command": cmd, "gpu_uuids": gpu_ids, "assigned_sample_ids": [s["id"] for s in shard]})
         with log_path.open("wb") as log:
             proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -312,7 +312,7 @@ def offline_check(run, require_pass=False):
 
 def open_prior(path, directory, require_pass=False):
     # Run the verifier from the checked-out repo against the mounted artifact.
-    from kaggle_quanti.verify import verify
+    from code_as_world.kaggle.verify import verify
 
     target = unpack(path, directory)
     verify(target, require_pass=require_pass)
