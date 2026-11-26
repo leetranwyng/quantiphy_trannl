@@ -1,0 +1,174 @@
+{
+  "model": {
+    "repo_id": "MirroS-Lab/Code-as-World-VL-4B",
+    "revision": "e40376ec0273abfee74132b7593ed6e39e650f3a",
+    "files": {
+      "chat_template.jinja": {
+        "size": 7585,
+        "sha256": null,
+        "git_blob": "dad26391f4e996320915996a99c31e3de9270ec2"
+      },
+      "config.json": {
+        "size": 2905,
+        "sha256": null,
+        "git_blob": "fb1496a874757398505133e565ffda41ea694ac3"
+      },
+      "generation_config.json": {
+        "size": 206,
+        "sha256": null,
+        "git_blob": "a2e5671a75d8c47fd4813058fee9d2e34363730d"
+      },
+      "model.safetensors": {
+        "size": 10350019328,
+        "sha256": "b0a64f8fc11e9eb66b027901f503426557e45dcb61cbeb83a4fd529fe874f1bc",
+        "git_blob": "6213af20349a8fe29239653ecbaf5748a216a812"
+      },
+      "processor_config.json": {
+        "size": 1191,
+        "sha256": null,
+        "git_blob": "33818c7f9e991ad735fd240209f4fa73e6c28c50"
+      },
+      "tokenizer.json": {
+        "size": 19989325,
+        "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+        "git_blob": "5520bfd2dd834ce386c1312c410fa71af56db5ad"
+      },
+      "tokenizer_config.json": {
+        "size": 1165,
+        "sha256": null,
+        "git_blob": "1d134cd298be1e3be25db393d93a1cefe80e3214"
+      }
+    }
+  },
+  "dataset": {
+    "repo_id": "PaulineLi/QuantiPhy-validation",
+    "revision": "2d56ff31c22c12bf377b2c2092ff229d291fd830",
+    "files": {
+      "validation_videos/ captured_0041x.mp4": {
+        "size": 126143,
+        "sha256": "f096debad0a8cabda4addbd216c22fc4d0a5c487417a4807149b6b13cf75b29c",
+        "git_blob": "d9479c83238a9579dc6cd310bce484d73c5d7b55"
+      },
+      "validation_videos/captured_0013.mp4": {
+        "size": 160049,
+        "sha256": "467065efb442f7b8ad0590f7e193815c73bf4c4187b28483519289c8d7afd899",
+        "git_blob": "415cd8f3b5199c3930f85b23f747656f956b2236"
+      },
+      "validation_videos/captured_0021x.mp4": {
+        "size": 84998,
+        "sha256": "630cda20e4bfb937c5b31a2586ad2ea7deb54a1ea0c31d732d01d8c094467b04",
+        "git_blob": "7149f34b32f33c7445cb5a218e6a5f658e8a617b"
+      },
+      "validation_videos/captured_0027s.mp4": {
+        "size": 102019,
+        "sha256": "d1a8562b8bb5d9165122c4c56f4eeb1ee76499221eaa2f309b5f7403f0c5f5e8",
+        "git_blob": "2e56d9f6a7db7646dac081ff81649c57a19ad3cc"
+      },
+      "validation_videos/captured_0034as.mp4": {
+        "size": 148958,
+        "sha256": "9ac35254ee8820a3bca4f4daaf4577eb211bf4f4c95b2ad22bd35c2cda812383",
+        "git_blob": "3ebf9b61127acedb2004014227274de02fff101a"
+      },
+      "validation_videos/captured_0061.mp4": {
+        "size": 135360,
+        "sha256": "b744b35ff86e91cbba3de12388ffd10a08660aed8ee87ffb52d4c62ad04390ae",
+        "git_blob": "5ea90cc3611c91c90a07bf482dde1b928e60e2f6"
+      },
+      "validation_videos/internet_0001.mp4": {
+        "size": 105131,
+        "sha256": "79c035962361884f49233ee3fa8be67b2daeef96c983ab71dffa9fcd189c60c9",
+        "git_blob": "06dcdb7e015c41df13fbbb704f99e6854b359529"
+      },
+      "validation_videos/internet_0004.mp4": {
+        "size": 1237619,
+        "sha256": "8cf0d1dbf4cb8a8672d0f7f10b1d41e5c93a3d936877fc2e632ccb6c406ce9f6",
+        "git_blob": "435bf9360f5bbe49b69b77a71bd7746046225e8a"
+      },
+      "validation_videos/internet_0005.mp4": {
+        "size": 466093,
+        "sha256": "84ff5f2812b87423d78de9c34ae47275c7c34b6158e8454d9c132c9b4dd4319d",
+        "git_blob": "62f5c9bbfc9d249bc81ec934c45e8d4d0e080930"
+      },
+      "validation_videos/internet_0013.mp4": {
+        "size": 593358,
+        "sha256": "54e8f566784525597803685c4be903579a9201f6261b9537abb7921201482495",
+        "git_blob": "cf26dcf8403a3727aa4f2ea3de0bf1071cefb4e5"
+      },
+      "validation_videos/internet_0019.mp4": {
+        "size": 118768,
+        "sha256": "0e8e0e78e29545d695a620cf794de158f33255b731940471c0c34f6962d99f9d",
+        "git_blob": "957c601463334c304768f1a509efff2e6ddde88d"
+      },
+      "validation_videos/internet_0027.mp4": {
+        "size": 156127,
+        "sha256": "2898efc0afb83686221f1ee087130fa4f7ee79705f3a95c7a0a9a7ea6e8b6be5",
+        "git_blob": "840162eecc578dec75f460c82c10a85025ac38e6"
+      },
+      "validation_videos/simulation_0009.mp4": {
+        "size": 402790,
+        "sha256": "ba884604caedf57ec8ecee04471790dc9b5740aca8e6e0c24bec7ae4f633919a",
+        "git_blob": "e6d3b7367af6443df1bcba85905eaca440a9e437"
+      },
+      "validation_videos/simulation_0015.mp4": {
+        "size": 356094,
+        "sha256": "3be619763fd9d77ccc1ded08bc678f03513c13a3b259fc78d1b1a2fe197294b6",
+        "git_blob": "b8fa9d01785287ac3caa3153d1e96b55b4a1dc38"
+      },
+      "validation_videos/simulation_0034_segmented.mp4": {
+        "size": 130686,
+        "sha256": "7e1f19cf5906213d3aaa94c3d41739c1cca1671187fe03149593ed4562b9e78f",
+        "git_blob": "d40d3716ca14e3288ead6638b727641ef804658d"
+      },
+      "validation_videos/simulation_0060.mp4": {
+        "size": 207766,
+        "sha256": "6dee1b516d3cf88cc2980bb664177f40fe061c919be5db1d32b1b15dcac23312",
+        "git_blob": "bc9b692399ede23150cd21d184d8b5645586ec46"
+      },
+      "validation_videos/simulation_0089.mp4": {
+        "size": 50349,
+        "sha256": "deeb3f0b264216a8bd8b75de1a741386a6e289f48263ff9636c752d4e674b157",
+        "git_blob": "29e072f4bc86a680402d4bc064232b65ed009cd4"
+      },
+      "validation_videos/simulation_0098_segmented.mp4": {
+        "size": 192085,
+        "sha256": "0ee3da32703a6876d430efbdccc2c872e29148e55c6d3dee92df677bf52b180b",
+        "git_blob": "8e8aa8b9a358f658c404d48d157d5da3ffbf50ff"
+      },
+      "validation_videos/simulation_0163.mp4": {
+        "size": 237595,
+        "sha256": "687c8ff21b2452864a50810e43cd952785abfe11daa6cbde50bce54a9d376edd",
+        "git_blob": "c89acc216ba96d6b8bf2396b293af7d2d3f44f53"
+      },
+      "validation_videos/simulation_0170_segmented.mp4": {
+        "size": 165489,
+        "sha256": "116aafcb6cd831eaedce74a583f0b93318e5e7b17dcc20d3708acbd42d51e147",
+        "git_blob": "4a9397432f01a49bea182facabfa26ee660de516"
+      },
+      "validation_videos/simulation_0171.mp4": {
+        "size": 189479,
+        "sha256": "503b49400eae6bab5179092acc50862fb1355f499b22a24e1188025630a18d86",
+        "git_blob": "5307673695ac7afaf35cd0780fc9ba858d420343"
+      },
+      "validation_videos/simulation_0193.mp4": {
+        "size": 323710,
+        "sha256": "a5c7b01a11c6646c69bff586669f3984772298de68edf3d37b5890f3c92e7577",
+        "git_blob": "88e5d92ef25b003ed0e8f9a8899fe000f803ffeb"
+      },
+      "validation_videos/simulation_0196.mp4": {
+        "size": 130820,
+        "sha256": "4e23275431eac20e61071f1af361359404f939616b2c0f60dad872acdfeb431d",
+        "git_blob": "d1d04b0f6a4b9a97ed1f7504847e5a5f644c6a65"
+      },
+      "validation_videos/simulation_0300.mp4": {
+        "size": 143807,
+        "sha256": "07099e284ffaec410c764c8e541fbf5e9a6a08782b458f7cac62168730162b83",
+        "git_blob": "a7de2ef71e1776ddd426b9b15df3fcec1a644e82"
+      }
+    }
+  },
+  "benchmark": {
+    "repo_url": "https://github.com/Paulineli/QuantiPhy.git",
+    "revision": "aa8daa7a5736ce3514ed985189ad27ef4a2e6e68"
+  },
+  "upstream_commit": "1353bf07d24e5463caff92ce23ffd34d03984831"
+}
