@@ -191,6 +191,8 @@ def _load_csv(
             record = {
                 "id": f"quantiphy_{len(records)}",
                 "original_id": original_id,
+                "source_record_number": row_number,
+                "source_line_end": reader.line_num,
                 "video": _resolve_video_path(
                     cell(row, "video", "video_path", "video_file"),
                     video_id,
@@ -296,23 +298,30 @@ def _record_metadata(record: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
-def _build_prompt_ids(
-    example: dict[str, Any], tokenizer: Any, processor: Any, format_prompt: Template
-) -> list[int]:
-    messages = [
+def _messages(example, format_prompt):
+    return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _message_content(example, format_prompt)},
     ]
-    rendered = processor.apply_chat_template(
+
+
+def _render_prompt(messages, processor):
+    return processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=False,
         enable_thinking=False,
     )
+
+
+def _build_prompt_ids(
+    example: dict[str, Any], tokenizer: Any, processor: Any, format_prompt: Template
+) -> list[int]:
+    rendered = _render_prompt(_messages(example, format_prompt), processor)
     return tokenizer.encode(rendered, add_special_tokens=False)[:MAX_PROMPT_LENGTH]
 
 
-def _process_video(video: str) -> tuple[Any, float]:
+def _process_video(video: str, on_request=None) -> tuple[Any, float]:
     from qwen_vl_utils.vision_process import fetch_video
 
     if not video.startswith(("http://", "https://", "s3://", "file://")) and not os.path.isfile(video):
@@ -325,6 +334,8 @@ def _process_video(video: str) -> tuple[Any, float]:
         "nframes": VIDEO_NFRAMES,
     }
     try:
+        if on_request is not None:
+            on_request(dict(vision_info))
         return fetch_video(
             vision_info,
             return_video_sample_fps=True,
@@ -338,6 +349,8 @@ def _process_video(video: str) -> tuple[Any, float]:
         if requested <= max_allowed or max_allowed < min_allowed:
             raise
         vision_info["nframes"] = max_allowed
+        if on_request is not None:
+            on_request(dict(vision_info))
         return fetch_video(
             vision_info,
             return_video_sample_fps=True,
@@ -345,7 +358,7 @@ def _process_video(video: str) -> tuple[Any, float]:
         )
 
 
-def _video_input(example: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _video_input(example: dict[str, Any], observe=None, on_request=None) -> tuple[dict[str, Any], dict[str, Any]]:
     processed_videos: list[Any] = []
     metadata_list: list[dict[str, Any]] = []
     timestamp_fps = _positive_float(example.get("fps")) or VIDEO_TIMESTAMP_FPS
@@ -359,7 +372,8 @@ def _video_input(example: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
         "frames_indices",
     }
     for video in _video_values(example):
-        video_out, sample_fps = _process_video(video)
+        video_out, sample_fps = _process_video(video, on_request)
+        raw_metadata = None
         metadata: dict[str, Any] = {}
         if isinstance(video_out, tuple) and len(video_out) == 2:
             video_input, raw_metadata = video_out
@@ -379,11 +393,14 @@ def _video_input(example: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
             frame_indices = frame_indices.detach().cpu().tolist()
         elif frame_indices is not None:
             frame_indices = list(frame_indices)
-        if not frame_indices or len(frame_indices) != num_frames:
+        synthetic = not frame_indices or len(frame_indices) != num_frames
+        if synthetic:
             frame_indices = list(range(num_frames))
         metadata["fps"] = processor_fps
         metadata["frames_indices"] = frame_indices
         metadata["total_num_frames"] = int(metadata.get("total_num_frames", num_frames))
+        if observe is not None:
+            observe(video_input, raw_metadata, sample_fps, metadata, synthetic)
         processed_videos.append(video_input)
         metadata_list.append(metadata)
     return {"video": list(zip(processed_videos, metadata_list))}, {
