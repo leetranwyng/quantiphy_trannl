@@ -1,4 +1,8 @@
-# IIIXR — Tái hiện & Truy vết nhánh đo chuyển động 2D (`g_box`) trên Kaggle 2×T4
+# IIIXR trên Kaggle GPU T4 x2
+
+[Validation 3D gồm 90 câu trên 12 video](kaggle/three_d/README.md)
+
+## Nhánh đo chuyển động 2D `g_box`
 
 Thư mục này chứa mã nguồn upstream đã pin và gói thực thi/instrumentation trên Kaggle `GPU T4 ×2` cho nhánh đo chuyển động 2D (`g_box`, `mode_box="2d_ratio"`) của đội **IIIXR** (CVPR/NeurIPS QuantiPhy Challenge).
 
