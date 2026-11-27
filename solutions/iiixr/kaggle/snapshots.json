@@ -15,6 +15,12 @@
       "bytes": 45,
       "sha256": "3ad624f04df22509b6b16330363c98ce21401fede20e037884ebeafe972c017e",
       "T_owl": 0.09807931631803513
+    },
+    "val_geo_raw": {
+      "member": "preds/val_geo_v4ntrj5sQ2srngsr_d_vw_raw.csv",
+      "bytes": 68799,
+      "sha256": "ac1db986370560996ff8a71ef107c70a5eb1436e4e285cb90f96d0bae08d2c41",
+      "expected_41_static2d_mean_mra": 0.5292682926829268
     }
   },
   "caw_baseline": {
@@ -23,7 +29,8 @@
     "predictions_member": "run/predictions.csv",
     "validation_csv_member": "run/configs/quantiphy_validation.csv",
     "expected_158_macro_mra": 0.4838907058654399,
-    "expected_18_subset_mean_mra": 0.4277777777777778
+    "expected_18_subset_mean_mra": 0.4277777777777778,
+    "expected_41_static2d_mean_mra": 0.5121951219512195
   },
   "benchmark": {
     "repo_url": "https://github.com/Paulineli/QuantiPhy.git",
@@ -97,6 +104,66 @@
         "width": 854,
         "height": 480,
         "frames": 40,
+        "csv_fps": 30.0,
+        "file_fps": 30.0
+      },
+      "internet_0004": {
+        "snapshot_path": "validation_videos/internet_0004.mp4",
+        "bytes": 1237619,
+        "sha256": "8cf0d1dbf4cb8a8672d0f7f10b1d41e5c93a3d936877fc2e632ccb6c406ce9f6",
+        "width": 854,
+        "height": 480,
+        "frames": 428,
+        "csv_fps": 25.0,
+        "file_fps": 25.0
+      },
+      "internet_0005": {
+        "snapshot_path": "validation_videos/internet_0005.mp4",
+        "bytes": 466093,
+        "sha256": "84ff5f2812b87423d78de9c34ae47275c7c34b6158e8454d9c132c9b4dd4319d",
+        "width": 854,
+        "height": 480,
+        "frames": 178,
+        "csv_fps": 25.0,
+        "file_fps": 25.0
+      },
+      "internet_0013": {
+        "snapshot_path": "validation_videos/internet_0013.mp4",
+        "bytes": 593358,
+        "sha256": "54e8f566784525597803685c4be903579a9201f6261b9537abb7921201482495",
+        "width": 854,
+        "height": 480,
+        "frames": 279,
+        "csv_fps": 30.0,
+        "file_fps": 29.97
+      },
+      "internet_0027": {
+        "snapshot_path": "validation_videos/internet_0027.mp4",
+        "bytes": 156127,
+        "sha256": "2898efc0afb83686221f1ee087130fa4f7ee79705f3a95c7a0a9a7ea6e8b6be5",
+        "width": 854,
+        "height": 480,
+        "frames": 78,
+        "csv_fps": 25.0,
+        "file_fps": 25.0
+      },
+      "simulation_0193": {
+        "snapshot_path": "validation_videos/simulation_0193.mp4",
+        "bytes": 323710,
+        "sha256": "a5c7b01a11c6646c69bff586669f3984772298de68edf3d37b5890f3c92e7577",
+        "width": 854,
+        "height": 480,
+        "frames": 100,
+        "csv_fps": 30.0,
+        "file_fps": 30.0
+      },
+      "simulation_0196": {
+        "snapshot_path": "validation_videos/simulation_0196.mp4",
+        "bytes": 130820,
+        "sha256": "4e23275431eac20e61071f1af361359404f939616b2c0f60dad872acdfeb431d",
+        "width": 480,
+        "height": 480,
+        "frames": 50,
         "csv_fps": 30.0,
         "file_fps": 30.0
       }

@@ -22,13 +22,18 @@ from solutions.iiixr.kaggle.kinematics import (
     recompute_from_saved_trace_arrays,
 )
 from solutions.iiixr.kaggle.schema import (
+    EXPECTED_STATIC_2D_VIDEO_BY_ID,
     EXPECTED_VIDEO_BY_ID,
     REPO_ROOT,
+    STATIC_2D_11_VIDEOS,
+    STATIC_2D_41_IDS,
+    STATIC_2D_SANITY_6_IDS,
     TARGET_6_VIDEOS,
     TARGET_18_IDS,
     UPSTREAM_DIR,
     FreshAntiCacheGuard,
     TraceStore,
+    load_cached_val_geo_raw,
     load_validation_inference_inputs,
     stage_assets_from_caw_tar,
     write_json_atomic,
@@ -124,7 +129,9 @@ class TestIIIXRBoxPipeline(unittest.TestCase):
         cls._tmp_obj = tempfile.TemporaryDirectory(prefix="iiixr-tests-")
         cls.tmp_dir = Path(cls._tmp_obj.name)
         if cls.caw_tar.is_file():
-            staged = stage_assets_from_caw_tar(cls.caw_tar, cls.tmp_dir / "staged", TARGET_6_VIDEOS)
+            staged = stage_assets_from_caw_tar(
+                cls.caw_tar, cls.tmp_dir / "staged", list(TARGET_6_VIDEOS) + ["internet_0027"]
+            )
             cls.val_csv = staged["csv_path"]
             cls.vid_dir = staged["video_dir"]
         else:
@@ -688,6 +695,291 @@ class TestIIIXRBoxPipeline(unittest.TestCase):
         self.assertTrue(summary["verification"]["verified"])
         self.assertEqual(summary["evaluation"]["fresh_coverage"]["generated_ok"], 4)
         self.assertGreaterEqual(summary["verification"]["cpu_recomputed_branch_traces"], 4)
+
+    def test_10_static2d_resolver_synthetic_size_dist2_orbitdiam_and_cpu_replay(self) -> None:
+        self.assertIsNotNone(self.val_csv)
+        # Validate notebook JSON structure for both new 2D static notebooks
+        for nb_name in ("iiixr_2d_static_sanity_t4.ipynb", "iiixr_2d_static_full_t4.ipynb"):
+            nb_path = REPO_ROOT / "solutions" / "iiixr" / "kaggle" / nb_name
+            self.assertTrue(nb_path.is_file(), f"Missing notebook {nb_name}")
+            nb_json = json.loads(nb_path.read_text(encoding="utf-8"))
+            self.assertEqual(nb_json.get("nbformat"), 4)
+            self.assertGreaterEqual(len(nb_json.get("cells", [])), 5)
+
+        # Resolver checks on static2d_41, static2d_sanity, and all2d_69
+        st_in = load_validation_inference_inputs(self.val_csv, scope="static2d_41")
+        self.assertEqual(tuple(r["id"] for r in st_in["selected_rows"]), STATIC_2D_41_IDS)
+        self.assertEqual(tuple(st_in["selected_videos"]), STATIC_2D_11_VIDEOS)
+        for r in st_in["selected_rows"]:
+            self.assertNotIn("ground_truth_value", r)
+            self.assertEqual(r["video_id"], EXPECTED_STATIC_2D_VIDEO_BY_ID[r["id"]])
+
+        san_in = load_validation_inference_inputs(self.val_csv, scope="static2d_sanity")
+        self.assertEqual(tuple(r["id"] for r in san_in["selected_rows"]), STATIC_2D_SANITY_6_IDS)
+        self.assertEqual(tuple(san_in["selected_videos"]), ("internet_0001", "internet_0027", "simulation_0163"))
+
+        all2d_in = load_validation_inference_inputs(self.val_csv, scope="all2d_69")
+        self.assertEqual(len(all2d_in["selected_rows"]), 69)
+
+        # Anti-cache guard must block load_cached_val_geo_raw inside fresh mode
+        with FreshAntiCacheGuard(enabled=True):
+            with self.assertRaises(PermissionError):
+                load_cached_val_geo_raw(UPSTREAM_DIR, STATIC_2D_41_IDS)
+
+        # Synthetic 2D static geometry tests + lossless CPU trace replay:
+        # 1) size (height) + winged bird width
+        # 2) dist2 with polygon edge-to-edge _poly_dist scaling at start vs end
+        # 3) orbitdiam in km around a central planet
+        fps = 24.0
+        fidx = list(range(40))
+        rows = [
+            {
+                "id": 9201, "video_id": "syn_static", "video_source": "simulation", "video_type": "S2SX",
+                "inference_type": "SS", "fps": fps,
+                "question": "What is the height of the bottle in m?",
+                "ground_truth_prior": "height of the pole = 2.0 m", "depth_info": "",
+            },
+            {
+                "id": 9202, "video_id": "syn_static", "video_source": "simulation", "video_type": "S2SX",
+                "inference_type": "SS", "fps": fps,
+                "question": "What is the width of the bird in m?",
+                "ground_truth_prior": "height of the pole = 2.0 m", "depth_info": "",
+            },
+            {
+                "id": 9203, "video_id": "syn_static", "video_source": "simulation", "video_type": "S2SX",
+                "inference_type": "SS", "fps": fps,
+                "question": "What is the distance between the red ball and the blue ball at the start of the video in m?",
+                "ground_truth_prior": "height of the pole = 2.0 m", "depth_info": "",
+            },
+            {
+                "id": 9204, "video_id": "syn_static", "video_source": "simulation", "video_type": "S2SX",
+                "inference_type": "SS", "fps": fps,
+                "question": "What is the distance between the red ball and the blue ball at the end of the video in m?",
+                "ground_truth_prior": "height of the pole = 2.0 m", "depth_info": "",
+            },
+        ]
+        parsed = parse_questions_v1_v2(rows)
+        v2_recs = [parsed["v2_records"][r["id"]] for r in rows]
+
+        # Pole height = 100 px => mpp = 0.02 m/px
+        fr_pole = _make_synthetic_track_frames(fidx, fps, lambda _t: (60.0, 240.0), box_w=16.0, box_h=100.0)
+        # Bottle height = 16 px => 0.32 m
+        fr_bottle = _make_synthetic_track_frames(fidx, fps, lambda _t: (140.0, 270.0), box_w=8.0, box_h=16.0)
+        # Bird box 50x20 => winged width uses 90th percentile of rr_long = 50 px => 1.00 m
+        fr_bird = _make_synthetic_track_frames(fidx, fps, lambda t: (220.0 + 10.0 * t, 120.0), box_w=50.0, box_h=20.0)
+
+        # Red ball (radius 30 -> box 60x60) at x=300, Blue ball at x=380 + 60*t:
+        # At t=0 (start): center dist c = 80 px, polygon edge gap g = 20 px (< 0.5*c = 40) => dist2 uses edge gap 20 px = 0.40 m!
+        # At t=end (39/24 = 1.625s): center dist c = 177.5 px, polygon gap g = 117.5 px (>= 0.5*c) => dist2 uses center dist!
+        def _with_poly_and_col(frames_in: list[dict], col_map: dict[str, float]) -> list[dict]:
+            for f in frames_in:
+                if f["st"] is not None:
+                    x0, y0, x1, y1 = f["st"]["box"]
+                    f["poly"] = [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]
+                    f["col"] = dict(col_map)
+            return frames_in
+
+        fr_red = _with_poly_and_col(
+            _make_synthetic_track_frames(fidx, fps, lambda _t: (300.0, 240.0), box_w=60.0, box_h=60.0),
+            {"red": 0.9, "blue": 0.05},
+        )
+        fr_blue = _with_poly_and_col(
+            _make_synthetic_track_frames(fidx, fps, lambda t: (380.0 + 60.0 * t, 240.0), box_w=60.0, box_h=60.0),
+            {"red": 0.05, "blue": 0.9},
+        )
+        vj = _make_synthetic_vj(
+            "syn_static", fidx, fps, 854, 480,
+            [
+                ("pole|", "pole", [], ["prior"], fr_pole),
+                ("bottle|", "bottle", [], ["target"], fr_bottle),
+                ("bird|", "bird", [], ["target"], fr_bird),
+                ("red ball|", "red ball", [], ["target", "dist"], fr_red),
+                ("blue ball|", "blue ball", [], ["target", "dist"], fr_blue),
+            ],
+        )
+        out = measure_video_instrumented(v2_recs, vj, t_owl=0.0980793)
+        self.assertAlmostEqual(float(out["results_by_id"][9201]["geo_value"]), 0.32, places=5)
+        self.assertAlmostEqual(float(out["results_by_id"][9202]["geo_value"]), 1.00, places=5)
+        self.assertAlmostEqual(float(out["results_by_id"][9203]["geo_value"]), 0.40, places=3)
+        self.assertGreater(float(out["results_by_id"][9204]["geo_value"]), 3.30)
+
+        # Verify pure-CPU recomputation from saved .npy arrays reproduces every static measurement (including _poly_dist!)
+        for qid in (9201, 9202, 9203, 9204):
+            rec_cpu = recompute_from_saved_trace_arrays(
+                out["traces_by_id"][qid]["replay_spec"],
+                out["arrays_by_id"][qid],
+            )
+            self.assertAlmostEqual(
+                float(out["results_by_id"][qid]["geo_value"]),
+                float(rec_cpu["geo_value"]),
+                places=10,
+            )
+
+        # Orbit diameter on tabletop orrery scale (matching simulation_0193 #506/#508/#509 within PLAUS[0] <= 500 m)
+        orbit_rows = [{
+            "id": 9205, "video_id": "syn_orbit", "video_source": "simulation", "video_type": "S2SX",
+            "inference_type": "DS", "fps": fps,
+            "question": "What is the orbital diameter of Io in m?",
+            "ground_truth_prior": "diameter of Jupiter = 0.70 m", "depth_info": "",
+        }]
+        p_orb = parse_questions_v1_v2(orbit_rows)
+        # Jupiter diameter = 70 px => mpp = 0.01 m/px; Io orbit radius = 210 px => diameter = 420 px = 4.20 m
+        fr_jup = _make_synthetic_track_frames(fidx, fps, lambda _t: (427.0, 240.0), box_w=70.0, box_h=70.0)
+        fr_io = _make_synthetic_track_frames(
+            fidx, fps,
+            lambda t: (427.0 + 210.0 * math.cos(2.5 * t), 240.0 + 210.0 * math.sin(2.5 * t)),
+            box_w=12.0, box_h=12.0,
+        )
+        vj_orb = _make_synthetic_vj(
+            "syn_orbit", fidx, fps, 854, 480,
+            [
+                ("jupiter|", "jupiter", [], ["prior"], fr_jup),
+                ("io|", "io", [], ["target"], fr_io),
+            ],
+        )
+        out_orb = measure_video_instrumented([p_orb["v2_records"][9205]], vj_orb, t_owl=0.0980793)
+        self.assertAlmostEqual(float(out_orb["results_by_id"][9205]["geo_value"]), 4.20, delta=0.03)
+        orb_cpu = recompute_from_saved_trace_arrays(
+            out_orb["traces_by_id"][9205]["replay_spec"],
+            out_orb["arrays_by_id"][9205],
+        )
+        self.assertAlmostEqual(float(out_orb["results_by_id"][9205]["geo_value"]), float(orb_cpu["geo_value"]), places=8)
+
+    def test_11_end_to_end_static2d_replay_mra_and_sanity_workflow(self) -> None:
+        from unittest.mock import patch
+        from solutions.iiixr.kaggle import workflow
+
+        self.assertTrue(self.caw_tar.is_file(), "quantiphy_full.tar required for end-to-end static2d replay check")
+        out_replay = self.tmp_dir / "e2e_static2d_replay"
+        cmd = [
+            sys.executable,
+            "-m",
+            "solutions.iiixr.kaggle.workflow",
+            "replay",
+            "--scope",
+            "static2d_41",
+            "--caw-tar",
+            str(self.caw_tar),
+            "--cache",
+            str(self.tmp_dir / "static2d_cache"),
+            "--output",
+            str(out_replay),
+            "--run-id",
+            "static2d-replay-check",
+            "--no-tar",
+        ]
+        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+        summary = json.loads((out_replay / "iiixr_2d_static_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["status"], "COMPLETE")
+        self.assertEqual(summary["scope"], "static2d_41")
+        self.assertTrue(summary["verification"]["verified"])
+        self.assertEqual(summary["evaluation"]["denominator_questions"], 41)
+
+        mra = summary["evaluation"]["mean_per_question_mra"]
+        self.assertAlmostEqual(mra["cached_box"], 0.5292682926829268, places=6)
+        self.assertAlmostEqual(mra["caw"], 0.5121951219512195, places=6)
+        self.assertIsNone(mra["fresh_box"])
+        self.assertIsNone(mra["cached_point_reference"])
+
+        pq_path = Path(summary["per_question_csv"])
+        with pq_path.open("r", encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(len(rows), 41)
+        by_id = {int(r["id"]): r for r in rows}
+        self.assertEqual(by_id[2151]["cached_mode"], "2d_ratio")
+        self.assertIsNotNone(by_id[2151]["cached_box"])
+        self.assertEqual(by_id[402]["cached_mode"], "vlm_2d_ratio")
+        self.assertEqual(by_id[403]["cached_why"], "target=prior_object")
+
+        # Mocked GPU sanity run on static2d_sanity (6 questions across internet_0001, internet_0027, simulation_0163)
+        ds_dir = self.tmp_dir / "mock_ds_static2d"
+        ds_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.val_csv, ds_dir / "validation_dataset.csv")
+        for vid in ("internet_0001", "internet_0027", "simulation_0163"):
+            shutil.copy2(self.vid_dir / f"{vid}.mp4", ds_dir / f"{vid}.mp4")
+        models_dir = self.tmp_dir / "mock_models_static2d"
+        for sub in ("grounding-dino-base", "owlv2-base-patch16-ensemble", "sam2.1-hiera-large", "Qwen3-VL-8B-Instruct"):
+            (models_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        out_san = self.tmp_dir / "static2d_sanity_out"
+        parser = workflow.build_arg_parser()
+        args = parser.parse_args([
+            "sanity",
+            "--scope",
+            "static2d_sanity",
+            "--allow-any-gpu",
+            "--dataset-dir",
+            str(ds_dir),
+            "--models-dir",
+            str(models_dir),
+            "--caw-tar",
+            str(self.caw_tar),
+            "--cache",
+            str(self.tmp_dir / "static2d_sanity_cache"),
+            "--output",
+            str(out_san),
+            "--run-id",
+            "static2d-sanity-check",
+            "--no-tar",
+        ])
+
+        def fake_vlm_subproc(**_kwargs):
+            return {"status": "ok", "stage": "vlm_stage", "llm_parse_outputs": {}, "vlm_ground_by_video": {}, "errors": []}
+
+        def fake_track_subproc(**kwargs):
+            vid_res = {}
+            for item in kwargs["video_items"]:
+                vid = item["video_id"]
+                fps = float(item["fps"])
+                fidx = list(range(36))
+                q_specs = []
+                seen_k = set()
+                idx_ent = 0
+                for r in item["parse_v2_records"]:
+                    for role_name, ent in (("target", r["target"]), ("dist", r.get("target2")), ("prior", r["prior_obj"])):
+                        if ent and ent.get("phrase"):
+                            rel = ent.get("rel")
+                            k = ent["phrase"] + "|" + ",".join(ent.get("where") or []) + ("|" + rel[0] + ":" + rel[1] if rel else "")
+                            if k not in seen_k:
+                                seen_k.add(k)
+                                offset_x = 120.0 + 95.0 * idx_ent
+                                idx_ent += 1
+                                fr = _make_synthetic_track_frames(
+                                    fidx, fps, lambda t, ox=offset_x: (ox + 15.0 * t, 220.0), box_w=42.0, box_h=24.0
+                                )
+                                for f in fr:
+                                    if f["st"] is not None:
+                                        x0, y0, x1, y1 = f["st"]["box"]
+                                        f["poly"] = [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]
+                                q_specs.append((k, ent["phrase"], list(ent.get("where") or []), [role_name], fr))
+                vj = _make_synthetic_vj(vid, fidx, fps, 854, 480, q_specs)
+                sr_entry = workflow.run_scene_ruler_on_video(
+                    vid, Path(item["video_path"]), [r["prior_text"] for r in item["parse_v2_records"]]
+                )
+                if sr_entry is not None:
+                    sr_entry.pop("overlay_rgb", None)
+                vid_res[vid] = {
+                    "video_id": vid,
+                    "track_v1": vj,
+                    "track_v2": vj,
+                    "track_v3nt": vj,
+                    "scene_ruler": sr_entry,
+                    "overlay_refs": {},
+                }
+            return {"video_results": vid_res, "errors": []}
+
+        with (
+            patch.object(workflow, "_run_gpu_vlm_subprocess", side_effect=fake_vlm_subproc),
+            patch.object(workflow, "_run_gpu_track_subprocesses", side_effect=fake_track_subproc),
+        ):
+            san_summary = workflow.execute_workflow(args)
+
+        self.assertEqual(san_summary["status"], "PASS")
+        self.assertEqual(san_summary["sanity_parity_report"]["sample_id"], 2272)
+        self.assertEqual(san_summary["sanity_parity_report"]["video_id"], "internet_0027")
+        self.assertTrue(san_summary["sanity_parity_report"]["identical_trace_off_on"])
+        self.assertTrue(san_summary["verification"]["verified"])
+        self.assertGreaterEqual(san_summary["verification"]["cpu_recomputed_branch_traces"], 8)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,94 @@ TARGET_6_VIDEOS: tuple[str, ...] = (
     "internet_0019",
 )
 
+STATIC_2D_41_IDS: tuple[int, ...] = (
+    139, 140, 141, 144,
+    402, 403,
+    498, 499, 503, 504, 505, 506, 507, 508, 509,
+    513, 514, 515, 516,
+    1897, 1898, 1899,
+    2151, 2152,
+    2161, 2162,
+    2165, 2166, 2167, 2168,
+    2200, 2201, 2202, 2205,
+    2228, 2229, 2230, 2231, 2232,
+    2272, 2275,
+)
+
+STATIC_2D_SANITY_6_IDS: tuple[int, ...] = (2151, 2152, 2272, 2275, 402, 403)
+
+EXPECTED_STATIC_2D_VIDEO_BY_ID: dict[int, str] = {
+    139: "simulation_0089",
+    140: "simulation_0089",
+    141: "simulation_0089",
+    144: "simulation_0089",
+    402: "simulation_0163",
+    403: "simulation_0163",
+    498: "simulation_0193",
+    499: "simulation_0193",
+    503: "simulation_0193",
+    504: "simulation_0193",
+    505: "simulation_0193",
+    506: "simulation_0193",
+    507: "simulation_0193",
+    508: "simulation_0193",
+    509: "simulation_0193",
+    513: "simulation_0196",
+    514: "simulation_0196",
+    515: "simulation_0196",
+    516: "simulation_0196",
+    1897: "simulation_0098_segmented",
+    1898: "simulation_0098_segmented",
+    1899: "simulation_0098_segmented",
+    2151: "internet_0001",
+    2152: "internet_0001",
+    2161: "internet_0004",
+    2162: "internet_0004",
+    2165: "internet_0005",
+    2166: "internet_0005",
+    2167: "internet_0005",
+    2168: "internet_0005",
+    2200: "internet_0013",
+    2201: "internet_0013",
+    2202: "internet_0013",
+    2205: "internet_0013",
+    2228: "internet_0019",
+    2229: "internet_0019",
+    2230: "internet_0019",
+    2231: "internet_0019",
+    2232: "internet_0019",
+    2272: "internet_0027",
+    2275: "internet_0027",
+}
+
+STATIC_2D_11_VIDEOS: tuple[str, ...] = (
+    "internet_0001",
+    "internet_0004",
+    "internet_0005",
+    "internet_0013",
+    "internet_0019",
+    "internet_0027",
+    "simulation_0089",
+    "simulation_0098_segmented",
+    "simulation_0163",
+    "simulation_0193",
+    "simulation_0196",
+)
+
+ALL_2D_12_VIDEOS: tuple[str, ...] = tuple(sorted(set(STATIC_2D_11_VIDEOS) | set(TARGET_6_VIDEOS)))
+
+VALID_SCOPES: tuple[str, ...] = (
+    "sanity4",
+    "target18",
+    "survey158",
+    "static2d_sanity",
+    "static2d_41",
+    "static2d_survey158",
+    "all2d_69",
+)
+
+STATIC_2D_SCOPES: tuple[str, ...] = ("static2d_sanity", "static2d_41", "static2d_survey158", "all2d_69")
+
 DEBUG_REFERENCE_ANCHORS: dict[int, dict[str, Any]] = {
     399: {"video_id": "simulation_0163", "cached_g_box": 0.38209679865232415},
     401: {"video_id": "simulation_0163", "cached_g_box": 0.3420306158490744},
@@ -200,6 +288,8 @@ def extract_iiixr_file_fps_val(upstream_dir: Path = UPSTREAM_DIR) -> dict[str, A
 class FreshAntiCacheGuard:
     """Context manager blocking any accidental read of mot_val_*, rows.pkl, or cached geo CSVs during fresh mode."""
 
+    _active_depth: int = 0
+
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
         self._orig_open = builtins.open
@@ -208,6 +298,7 @@ class FreshAntiCacheGuard:
     def __enter__(self) -> "FreshAntiCacheGuard":
         if not self.enabled:
             return self
+        FreshAntiCacheGuard._active_depth += 1
         orig_open = self._orig_open
         guard = self
 
@@ -226,6 +317,7 @@ class FreshAntiCacheGuard:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self.enabled:
+            FreshAntiCacheGuard._active_depth = max(0, FreshAntiCacheGuard._active_depth - 1)
             builtins.open = self._orig_open
 
 
@@ -252,12 +344,36 @@ def classify_2d_motion_support(row: dict[str, Any]) -> tuple[bool, str]:
     return False, "outside_18_reference_motion_subset"
 
 
+def classify_scope_support(row: dict[str, Any], scope: str) -> tuple[bool, str]:
+    """Determine whether a QuantiPhy validation row is in-scope for the requested experiment scope."""
+    qid = int(row["id"])
+    vtype = str(row.get("video_type") or "")
+    itype = str(row.get("inference_type") or "")
+    if scope in ("sanity4", "target18", "survey158"):
+        return classify_2d_motion_support(row)
+    if scope in ("static2d_sanity", "static2d_41", "static2d_survey158"):
+        if qid in EXPECTED_STATIC_2D_VIDEO_BY_ID:
+            return True, f"target_41_2d_static({itype})"
+        if len(vtype) >= 2 and vtype[1] == "3":
+            return False, f"unsupported_3d_video_type({vtype})"
+        if len(itype) >= 2 and itype[1] == "D":
+            return False, f"unsupported_dynamic_target_for_static2d({itype})"
+        return False, "outside_41_2d_static_subset"
+    if scope == "all2d_69":
+        if len(vtype) >= 2 and vtype[1] == "2":
+            return True, f"target_69_2d_all({itype})"
+        return False, f"unsupported_3d_video_type({vtype})"
+    raise ValueError(f"Unknown scope '{scope}'. Expected one of {VALID_SCOPES}.")
+
+
 def load_validation_inference_inputs(
     csv_path: Path,
     scope: str = "target18",
     explicit_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Load validation questions WITHOUT ground_truth_posterior, keyed strictly by canonical CSV ID."""
+    if scope not in VALID_SCOPES:
+        raise ValueError(f"Unknown scope '{scope}'. Expected one of {VALID_SCOPES}.")
     if not csv_path.is_file():
         raise FileNotFoundError(f"Validation CSV not found: {csv_path}")
     raw_bytes = csv_path.read_bytes()
@@ -290,22 +406,24 @@ def load_validation_inference_inputs(
             "ground_truth_prior": prior_val,
             "depth_info": depth_val,
         }
-        in_scope, support_reason = classify_2d_motion_support(rec)
-        rec["in_scope_2d_motion"] = in_scope
+        in_scope, support_reason = classify_scope_support(rec, scope)
+        rec["in_scope"] = in_scope
+        rec["in_scope_2d_motion"] = in_scope  # Kept as alias for backward compatibility
         rec["support_reason"] = support_reason
         assert "ground_truth_posterior" not in rec
         all_rows_by_id[qid] = rec
         id_mapping.append({"id": qid, "csv_row_index": int(row_idx), "video_id": vid, "cat": cat})
 
-    # Always verify all 18 canonical IDs and their expected videos when present
-    for tid, expected_vid in EXPECTED_VIDEO_BY_ID.items():
-        if tid not in all_rows_by_id:
-            raise ValueError(f"Canonical target ID {tid} missing from {csv_path}")
-        actual_vid = all_rows_by_id[tid]["video_id"]
-        if actual_vid != expected_vid:
-            raise ValueError(
-                f"ID/video join mismatch for ID {tid}: expected video '{expected_vid}', got '{actual_vid}'"
-            )
+    # Always verify all 18 canonical motion IDs AND all 41 canonical 2D static IDs against their expected videos
+    for expected_map in (EXPECTED_VIDEO_BY_ID, EXPECTED_STATIC_2D_VIDEO_BY_ID):
+        for tid, expected_vid in expected_map.items():
+            if tid not in all_rows_by_id:
+                raise ValueError(f"Canonical target ID {tid} missing from {csv_path}")
+            actual_vid = all_rows_by_id[tid]["video_id"]
+            if actual_vid != expected_vid:
+                raise ValueError(
+                    f"ID/video join mismatch for ID {tid}: expected video '{expected_vid}', got '{actual_vid}'"
+                )
 
     if explicit_ids is not None:
         wanted_ids = tuple(int(x) for x in explicit_ids)
@@ -313,13 +431,19 @@ def load_validation_inference_inputs(
         wanted_ids = SANITY_4_IDS
     elif scope == "target18":
         wanted_ids = TARGET_18_IDS
-    elif scope == "survey158":
+    elif scope in ("survey158", "static2d_survey158"):
         wanted_ids = tuple(sorted(all_rows_by_id.keys()))
+    elif scope == "static2d_sanity":
+        wanted_ids = STATIC_2D_SANITY_6_IDS
+    elif scope == "static2d_41":
+        wanted_ids = STATIC_2D_41_IDS
+    elif scope == "all2d_69":
+        wanted_ids = tuple(sorted(qid for qid, rec in all_rows_by_id.items() if rec["in_scope"]))
     else:
-        raise ValueError(f"Unknown scope '{scope}'. Expected 'sanity4', 'target18', or 'survey158'.")
+        raise ValueError(f"Unknown scope '{scope}'.")
 
     selected_rows = [dict(all_rows_by_id[qid]) for qid in wanted_ids]
-    selected_videos = sorted({r["video_id"] for r in selected_rows if r["in_scope_2d_motion"]})
+    selected_videos = sorted({r["video_id"] for r in selected_rows if r["in_scope"]})
     video_context_rows: dict[str, list[dict[str, Any]]] = {v: [] for v in selected_videos}
     for rec in all_rows_by_id.values():
         if rec["video_id"] in video_context_rows:
@@ -492,9 +616,10 @@ def read_caw_predictions_from_tar(
         if qid not in wanted:
             continue
         vid = str(row["video_id"]).strip()
-        if qid in EXPECTED_VIDEO_BY_ID and vid != EXPECTED_VIDEO_BY_ID[qid]:
+        expected_vid_caw = EXPECTED_VIDEO_BY_ID.get(qid) or EXPECTED_STATIC_2D_VIDEO_BY_ID.get(qid)
+        if expected_vid_caw and vid != expected_vid_caw:
             raise ValueError(
-                f"CAW archive ID/video mismatch for ID {qid}: expected {EXPECTED_VIDEO_BY_ID[qid]}, got {vid}"
+                f"CAW archive ID/video mismatch for ID {qid}: expected {expected_vid_caw}, got {vid}"
             )
         pv_raw = str(row.get("parsed_value", "")).strip()
         pv = float(pv_raw) if pv_raw not in ("", "nan", "None") else float("nan")
@@ -582,6 +707,62 @@ def load_cached_mot_val(
         rec["cache_sha256"] = sha256_bytes(raw)
         rec["cache_relpath"] = p.relative_to(upstream_dir).as_posix()
         out[qid] = rec
+    return out
+
+
+def load_cached_val_geo_raw(
+    upstream_dir: Path = UPSTREAM_DIR,
+    target_ids: tuple[int, ...] = STATIC_2D_41_IDS,
+) -> dict[int, dict[str, Any]]:
+    """Load IIIXR reference geometry outputs from preds/val_geo_v4ntrj5sQ2srngsr_d_vw_raw.csv (eval/replay ONLY)."""
+    if FreshAntiCacheGuard._active_depth > 0:
+        raise PermissionError(
+            "Fresh-mode anti-cache guard blocked load_cached_val_geo_raw() during fresh inference!"
+        )
+    lock = read_snapshots()["upstream"]["val_geo_raw"]
+    inter_path = upstream_dir / "intermediates" / "intermediates.tar.xz"
+    with tarfile.open(inter_path, "r:xz") as tf:
+        member = tf.extractfile(lock["member"])
+        if member is None:
+            raise FileNotFoundError(f"Missing {lock['member']} in {inter_path}")
+        raw_bytes = member.read()
+    digest = sha256_bytes(raw_bytes)
+    if digest != lock["sha256"]:
+        raise ValueError(f"val_geo_raw SHA256 mismatch: {digest} != {lock['sha256']}")
+
+    df = pd.read_csv(io.BytesIO(raw_bytes))
+    id_col = _parse_id_column(df)
+    wanted = set(int(x) for x in target_ids)
+    out: dict[int, dict[str, Any]] = {}
+    for _, r in df.iterrows():
+        qid = int(r[id_col])
+        if qid not in wanted:
+            continue
+        vid = str(r["video_id"]).strip()
+        expected_vid = EXPECTED_STATIC_2D_VIDEO_BY_ID.get(qid) or EXPECTED_VIDEO_BY_ID.get(qid)
+        if expected_vid and vid != expected_vid:
+            raise ValueError(f"val_geo_raw ID/video mismatch for ID {qid}: expected {expected_vid}, got {vid}")
+        gv = None if pd.isna(r.get("geo_value")) else float(r["geo_value"])
+        mmode = "" if pd.isna(r.get("meas_mode")) else str(r["meas_mode"])
+        msrc = "" if pd.isna(r.get("merge_src")) else str(r["merge_src"])
+        mtrk = "" if pd.isna(r.get("meas_tracks")) else str(r["meas_tracks"])
+        mwhy = "" if pd.isna(r.get("meas_why")) else str(r["meas_why"])
+        mkind = "" if pd.isna(r.get("meas_kind")) else str(r["meas_kind"])
+        tv_tag = "v3nt" if msrc in ("v", "xg_v") or mmode.startswith("vlm_") else (msrc if msrc in ("sruler", "ruler") else (mtrk or "none"))
+        out[qid] = {
+            "id": qid,
+            "video": vid,
+            "g_box": gv,
+            "g_pt": None,
+            "tv": tv_tag,
+            "mode_box": mmode,
+            "merge_src": msrc,
+            "meas_tracks": mtrk,
+            "why": mwhy,
+            "kind": mkind,
+            "cache_sha256": digest,
+            "cache_relpath": f"intermediates/intermediates.tar.xz:{lock['member']}",
+        }
     return out
 
 

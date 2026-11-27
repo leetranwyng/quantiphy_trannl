@@ -58,6 +58,7 @@ def _load_upstream_geo_modules(upstream_dir: Path = UPSTREAM_DIR):
     import measure_v3 as mv3
     import parse as parse_v1
     import parse_v2
+    import qp_common as qpc
     import rules as rules_v1
     import rules_v2
     import track_common as tc
@@ -74,10 +75,40 @@ def _load_upstream_geo_modules(upstream_dir: Path = UPSTREAM_DIR):
         "rules_v2": rules_v2,
         "parse_v1": parse_v1,
         "parse_v2": parse_v2,
+        "qpc": qpc,
         "tc": tc,
         "m1": m1,
         "mv3": mv3,
     }
+
+
+def _compute_h1_prior_copy(qpc: Any, question: str, inference_type: str, prior_text: str, pr0: dict[str, Any] | None) -> float:
+    """Exact reproduction of tools/heuristic.py:h1_prior_copy (tau = 1.0s dimensional conversion)."""
+    tu = qpc.target_unit(question, inference_type)
+    si, k_from = qpc.prior_value(prior_text)
+    if si is None and pr0 and pr0.get("value_si") is not None:
+        si = float(pr0["value_si"])
+        k_from = {"size": 0, "speed": 1, "accel": 2}.get(str(pr0.get("kind") or ""), 0)
+    if si is None:
+        return 1.0
+    f_to, k_to = qpc.UNIT_TABLE[tu]
+    if k_from == k_to:
+        conv_si = si
+    elif (k_from, k_to) == (0, 1):
+        conv_si = si / 1.0
+    elif (k_from, k_to) == (1, 0):
+        conv_si = si * 1.0
+    elif (k_from, k_to) == (2, 0):
+        conv_si = 0.5 * si * (1.0**2)
+    elif (k_from, k_to) == (0, 2):
+        conv_si = 2.0 * si / (1.0**2)
+    elif (k_from, k_to) == (1, 2):
+        conv_si = si / 1.0
+    elif (k_from, k_to) == (2, 1):
+        conv_si = si * 1.0
+    else:
+        conv_si = si
+    return abs(float(conv_si / f_to))
 
 
 def parse_questions_v1_v2(
@@ -671,9 +702,33 @@ def _track_arrays_dict(trk: Any, vj: dict[str, Any]) -> dict[str, np.ndarray]:
     }
 
 
+def _extract_query_meta_for_replay(q_dict: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Serialize Track.q metadata plus sparse per-slot polygon/color dicts for lossless CPU replay."""
+    if q_dict is None:
+        return None
+    meta = {k: v for k, v in q_dict.items() if k != "frames"}
+    frames = q_dict.get("frames") or []
+    col_by_slot: dict[str, Any] = {}
+    poly_by_slot: dict[str, Any] = {}
+    for j, fr in enumerate(frames):
+        if not isinstance(fr, dict):
+            continue
+        if fr.get("col") is not None:
+            col_by_slot[str(j)] = fr["col"]
+        if fr.get("poly") is not None:
+            poly_by_slot[str(j)] = fr["poly"]
+    if col_by_slot:
+        meta["_replay_col_by_slot"] = col_by_slot
+    if poly_by_slot:
+        meta["_replay_poly_by_slot"] = poly_by_slot
+    return meta
+
+
 def _reconstruct_query_from_arrays(arrs: dict[str, np.ndarray], meta: dict[str, Any]) -> dict[str, Any]:
     """Rebuild upstream Track query dict purely from lossless numerical arrays + metadata."""
     n = len(arrs["fidx"])
+    col_map = meta.get("_replay_col_by_slot") or {}
+    poly_map = meta.get("_replay_poly_by_slot") or {}
     frames = []
     for j in range(n):
         if arrs["area"][j] > 0 and np.isfinite(arrs["c"][j]).all():
@@ -688,8 +743,13 @@ def _reconstruct_query_from_arrays(arrs: dict[str, np.ndarray], meta: dict[str, 
             }
         else:
             st = None
-        frames.append({"st": st, "lg": float(arrs["lg"][j])})
-    q = dict(meta)
+        fr_entry: dict[str, Any] = {"st": st, "lg": float(arrs["lg"][j])}
+        if str(j) in col_map:
+            fr_entry["col"] = col_map[str(j)]
+        if str(j) in poly_map:
+            fr_entry["poly"] = poly_map[str(j)]
+        frames.append(fr_entry)
+    q = {k: v for k, v in meta.items() if k not in ("_replay_col_by_slot", "_replay_poly_by_slot")}
     q["frames"] = frames
     return q
 
@@ -724,35 +784,63 @@ def _fit_detail(mv3: Any, m1: Any, ts: np.ndarray, Ps: np.ndarray, t0c: float, h
 
 
 def _compute_derived_curves(mv3: Any, trk: Any) -> dict[str, Any]:
-    """Compute smoothed trajectory & derived velocity/acceleration curves for viewer plots (marked derived=True)."""
-    if trk is None or trk.n < 3:
+    """Compute smoothed trajectory, static box/rr extents, and derived velocity/accel curves (marked derived=True)."""
+    if trk is None or trk.n < 1:
         return {"derived": True, "available": False}
     t = trk.t
     P = trk.uv
-    sg = trk.segs()
+    box_w, box_h, rr_long, rr_short, areas = [], [], [], [], []
+    for j in trk.okc:
+        st_j = trk.st[int(j)]
+        bx = st_j["box"]
+        rr = st_j["rr"]
+        box_w.append(float(bx[2] - bx[0]))
+        box_h.append(float(bx[3] - bx[1]))
+        rr_long.append(float(rr[0]))
+        rr_short.append(float(rr[1]))
+        areas.append(float(st_j["area"]))
+
     xs_s, ys_s, vx_s, vy_s, sp_s, ax_s, ay_s, ac_s = [], [], [], [], [], [], [], []
-    for ti in t:
-        pos = mv3.pos_at_c(t, P, float(ti), sg)
-        vel = mv3.vel_at_c(t, P, float(ti), sg, mv3.HALF_V)
-        acc = mv3.acc_at_c(t, P, float(ti), sg, mv3.HALF_A)
-        xs_s.append(float(pos[0]) if pos is not None else float("nan"))
-        ys_s.append(float(pos[1]) if pos is not None else float("nan"))
-        vx_s.append(float(vel[0]) if vel is not None else float("nan"))
-        vy_s.append(float(vel[1]) if vel is not None else float("nan"))
-        sp_s.append(float(np.linalg.norm(vel)) if vel is not None else float("nan"))
-        ax_s.append(float(acc[0]) if acc is not None else float("nan"))
-        ay_s.append(float(acc[1]) if acc is not None else float("nan"))
-        ac_s.append(float(np.linalg.norm(acc)) if acc is not None else float("nan"))
+    if trk.n >= 3:
+        sg = trk.segs()
+        for ti in t:
+            pos = mv3.pos_at_c(t, P, float(ti), sg)
+            vel = mv3.vel_at_c(t, P, float(ti), sg, mv3.HALF_V)
+            acc = mv3.acc_at_c(t, P, float(ti), sg, mv3.HALF_A)
+            xs_s.append(float(pos[0]) if pos is not None else float("nan"))
+            ys_s.append(float(pos[1]) if pos is not None else float("nan"))
+            vx_s.append(float(vel[0]) if vel is not None else float("nan"))
+            vy_s.append(float(vel[1]) if vel is not None else float("nan"))
+            sp_s.append(float(np.linalg.norm(vel)) if vel is not None else float("nan"))
+            ax_s.append(float(acc[0]) if acc is not None else float("nan"))
+            ay_s.append(float(acc[1]) if acc is not None else float("nan"))
+            ac_s.append(float(np.linalg.norm(acc)) if acc is not None else float("nan"))
+    else:
+        xs_s = P[:, 0].tolist()
+        ys_s = P[:, 1].tolist()
+        vx_s = [float("nan")] * len(t)
+        vy_s = [float("nan")] * len(t)
+        sp_s = [float("nan")] * len(t)
+        ax_s = [float("nan")] * len(t)
+        ay_s = [float("nan")] * len(t)
+        ac_s = [float("nan")] * len(t)
+
     return {
         "derived": True,
         "available": True,
-        "note": "Derived from saved track centroids via upstream pos_at_c/vel_at_c/acc_at_c for visual inspection; not a raw model output.",
+        "note": "Derived from saved track centroids and mask extents via upstream pos_at_c/vel_at_c/acc_at_c/ext_px for visual inspection; not a raw model output.",
         "t": t.tolist(),
         "okc": trk.okc.tolist(),
+        "oke": trk.oke.tolist(),
         "x_raw": P[:, 0].tolist(),
         "y_raw": P[:, 1].tolist(),
         "x_smooth": xs_s,
         "y_smooth": ys_s,
+        "box_w_px": box_w,
+        "box_h_px": box_h,
+        "rr_long_px": rr_long,
+        "rr_short_px": rr_short,
+        "area_px": areas,
         "vx_px_s": vx_s,
         "vy_px_s": vy_s,
         "speed_px_s": sp_s,
@@ -774,6 +862,7 @@ def measure_video_instrumented(
     mods = _load_upstream_geo_modules(upstream_dir)
     mv3 = mods["mv3"]
     m1 = mods["m1"]
+    qpc = mods["qpc"]
     rules_v1 = mods["rules_v1"]
 
     mv3.FIX = set("abcdef")
@@ -824,13 +913,15 @@ def measure_video_instrumented(
                 x["why"] = f"implausible({x['val_si']:.3g})"
                 x["value"] = float("nan")
 
-        # Arbitrate 2-decade h1 sanity rule (geo/arbitrate_v2.py lines 35-42)
+        # Arbitrate 2-decade h1 sanity rule (tools/heuristic.py + geo/arbitrate_v2.py lines 35-42)
         pr0 = r["priors"][0] if r["priors"] else None
-        h1_val = float("nan")
-        if pr0 and pr0.get("value_si") is not None:
-            # h1_prior_copy uses raw numeric value in prior text
-            m_num = re.search(r"[-+]?\d*\.?\d+", str(r.get("prior_text") or ""))
-            h1_val = abs(float(m_num.group(0))) if m_num else abs(float(pr0["value_si"]))
+        h1_val = _compute_h1_prior_copy(
+            qpc=qpc,
+            question=str(r.get("question") or ""),
+            inference_type=str(r.get("inference_type") or "SS"),
+            prior_text=str(r.get("prior_text") or ""),
+            pr0=pr0,
+        )
         arb_ok = bool(x["ok"])
         arb_why = str(x.get("why") or "")
         if arb_ok and np.isfinite(h1_val) and h1_val > 0:
@@ -850,6 +941,25 @@ def measure_video_instrumented(
 
         # --- Detailed Intermediate Trace for Target Questions ---
         tgt = V.get(r["target"])
+        tgt2 = V.get(r["target2"]) if r.get("target2") else None
+        tgt2_effective = tgt2
+        if (
+            os.environ.get("QP_SECOND_FIX") == "1"
+            and tgt is not None
+            and tgt2 is not None
+            and q.get("kind") == "dist2"
+            and str(vj.get("video_id", "")).startswith("simulation")
+            and (r.get("target2") or {}).get("where") == ["#second"]
+            and vj.get("objs")
+            and (
+                tgt2 is tgt
+                or m1.same_object(tgt, tgt2)
+                or (tgt.q.get("obj") is not None and tgt.q.get("obj") == tgt2.q.get("obj"))
+            )
+        ):
+            alt_t2 = mv3.second_instance(V, vj, tgt)
+            if alt_t2 is not None:
+                tgt2_effective = alt_t2
         prior_tr = V.get(r["prior_obj"]) if (r.get("prior_obj") or {}).get("phrase") else None
         gravity = bool(pr0 and pr0.get("gravity", False))
         grav_trace = None
@@ -885,23 +995,51 @@ def measure_video_instrumented(
         tgt_arrs = _track_arrays_dict(tgt, vj)
         for ak, av in tgt_arrs.items():
             q_arrays[f"tgt_{ak}"] = av
-        if prior_tr is not None:
+        if tgt2 is not None and tgt2 is not tgt:
+            t2_arrs = _track_arrays_dict(tgt2, vj)
+            for ak, av in t2_arrs.items():
+                q_arrays[f"tgt2_{ak}"] = av
+        if prior_tr is not None and prior_tr is not tgt and prior_tr is not tgt2:
             pr_arrs = _track_arrays_dict(prior_tr, vj)
             for ak, av in pr_arrs.items():
                 q_arrays[f"prior_{ak}"] = av
 
-        # Companion tracks metadata/arrays needed if gravity_scale_check or QP_SAMECLASS runs
+        # Companion tracks metadata/arrays needed if gravity_scale_check, QP_SAMECLASS, QP_NEAREST, or colour_assign runs
         companion_tracks_meta = []
-        for idx_tr, (tk_name, trk_other) in enumerate(V.tr.items()):
-            if trk_other is None or trk_other is tgt or trk_other is prior_tr:
+        referenced_oids: set[int] = set()
+        for tr_ref in (tgt, tgt2, prior_tr):
+            if tr_ref is not None and tr_ref.q.get("obj") is not None:
+                referenced_oids.add(int(tr_ref.q["obj"]))
+        for idx_tr, (_tk_name, trk_other) in enumerate(V.tr.items()):
+            if trk_other is None or trk_other in (tgt, tgt2, prior_tr):
                 continue
+            if trk_other.q.get("obj") is not None:
+                referenced_oids.add(int(trk_other.q["obj"]))
             oth_arrs = _track_arrays_dict(trk_other, vj)
             for ak, av in oth_arrs.items():
                 q_arrays[f"comp{idx_tr}_{ak}"] = av
             companion_tracks_meta.append({
                 "slot": f"comp{idx_tr}",
-                "query_meta": {k: v for k, v in trk_other.q.items() if k not in ("frames",)},
+                "query_meta": _extract_query_meta_for_replay(trk_other.q),
             })
+
+        # Also preserve any unreferenced vj["objs"] when dist2 #second might inspect all objects via second_instance()
+        extra_objs_meta = []
+        if vj.get("version") == "v2" and vj.get("objs") and q.get("kind") == "dist2":
+            for oid_str, fr_raw in vj["objs"].items():
+                oid_int = int(oid_str)
+                if oid_int in referenced_oids:
+                    continue
+                tmp_trk = mv3.Track({"key": f"_extra_obj_{oid_int}", "obj": oid_int}, vj, fr_raw)
+                ex_arrs = _track_arrays_dict(tmp_trk, vj)
+                for ak, av in ex_arrs.items():
+                    q_arrays[f"exobj{oid_int}_{ak}"] = av
+                extra_objs_meta.append({
+                    "slot": f"exobj{oid_int}",
+                    "oid": oid_int,
+                    "query_meta": _extract_query_meta_for_replay(tmp_trk.q),
+                })
+
         arrays_by_id[rid] = q_arrays
 
         # Prior scale step breakdown
@@ -1088,6 +1226,82 @@ def measure_video_instrumented(
                     "px_quantity": a_px,
                     "window_sensitivity": win_sens,
                 })
+            elif kind == "size":
+                dim_q = q.get("dim") or "length"
+                t_phrase = (r.get("target") or {}).get("phrase") or ""
+                ext_vals, ext_js = tgt.ext_px(dim_q, t_phrase)
+                v_px_raw = mv3.agg_ext(ext_vals, dim_q) if len(ext_vals) else float("nan")
+                v_px = float(v_px_raw) if np.isfinite(v_px_raw) else None
+                winged_hit = bool(re.search(m1.WINGED, t_phrase))
+                agg_rule = "percentile_75" if dim_q in ("diameter", "radius") else "median"
+                oke_fidx = [int(vj["fidx"][int(j)]) for j in ext_js]
+                target_step.update({
+                    "estimator": "ext_px_agg",
+                    "file_fn": "geo/measure_v3.py:Track.ext_px + geo/measure.py:agg_ext",
+                    "dim": dim_q,
+                    "agg_rule": agg_rule,
+                    "winged_override": winged_hit,
+                    "oke_track_slots": [int(j) for j in ext_js],
+                    "participating_video_frames": oke_fidx,
+                    "per_frame_extents_px": [float(v) for v in ext_vals],
+                    "px_quantity": v_px,
+                })
+            elif kind == "dist2":
+                min_flag = bool(re.search(r"\b(?:minimum|smallest|closest|shortest)\b", str(r.get("question") or "").lower()))
+                cands_t2 = mv3.nearest_cands(V, r, tgt2_effective) if tgt2_effective is not None else []
+                vs_d2 = [
+                    mv3.dist2_px(tgt, t2_, q["t"], q["when"], minimum=min_flag)
+                    for t2_ in cands_t2
+                ]
+                vs_valid = [x_ for x_ in vs_d2 if x_[0] is not None and np.isfinite(x_[0]) and x_[0] > 0] or vs_d2[:1]
+                if vs_valid:
+                    v_d2, gap_flag = min(vs_valid, key=lambda x_: x_[0] if (x_[0] is not None and np.isfinite(x_[0])) else float("inf"))
+                    v_px = float(v_d2) if (v_d2 is not None and np.isfinite(v_d2)) else None
+                else:
+                    v_px, gap_flag = None, False
+                part_fidx = [int(vj["fidx"][int(j)]) for j in tgt.okc]
+                target_step.update({
+                    "estimator": "dist2_px",
+                    "file_fn": "geo/measure_v3.py:dist2_px + _poly_dist",
+                    "target2_key": tgt2_effective.q.get("key") if tgt2_effective is not None else None,
+                    "second_fix_applied": bool(x.get("grav") == "second_fix"),
+                    "when": q.get("when"),
+                    "queried_t": float(q["t"]) if q.get("t") is not None else None,
+                    "minimum": min_flag,
+                    "used_polygon_edge_gap": bool(gap_flag),
+                    "participating_video_frames": part_fidx,
+                    "px_quantity": v_px,
+                })
+            elif kind == "orbitdiam":
+                v_orb = mv3.px_quantity(tgt, "orbitdiam", q["t"], q["t1"], q["t2"], q["when"])
+                v_px = float(v_orb) if (v_orb is not None and np.isfinite(v_orb)) else None
+                target_step.update({
+                    "estimator": "orbitdiam_px",
+                    "file_fn": "geo/measure_v3.py:px_quantity(kind='orbitdiam')",
+                    "participating_video_frames": [int(vj["fidx"][int(j)]) for j in tgt.okc],
+                    "px_quantity": v_px,
+                })
+            elif kind == "hfloor":
+                fl_px = mv3.floor_level(V)
+                v_hf = mv3.hfloor_px(tgt, V, q["t"])
+                v_px = float(v_hf) if (v_hf is not None and np.isfinite(v_hf)) else None
+                target_step.update({
+                    "estimator": "hfloor_px",
+                    "file_fn": "geo/measure_v3.py:floor_level + hfloor_px",
+                    "floor_level_px": float(fl_px) if fl_px is not None else None,
+                    "queried_t": float(q["t"]) if q.get("t") is not None else None,
+                    "participating_video_frames": [int(vj["fidx"][int(j)]) for j in tgt.oke],
+                    "px_quantity": v_px,
+                })
+            else:
+                v_gen = mv3.px_quantity(tgt, kind, q["t"], q["t1"], q["t2"], q["when"])
+                v_px = float(v_gen) if (v_gen is not None and np.isfinite(v_gen)) else None
+                target_step.update({
+                    "estimator": f"px_quantity_{kind}",
+                    "file_fn": "geo/measure_v3.py:px_quantity",
+                    "participating_video_frames": [int(vj["fidx"][int(j)]) for j in tgt.okc],
+                    "px_quantity": v_px,
+                })
 
         formula_trace = {
             "mode": x.get("mode", ""),
@@ -1099,6 +1313,7 @@ def measure_video_instrumented(
             "val_si": float(x["val_si"]) if np.isfinite(x.get("val_si", np.nan)) else None,
             "unit": u,
             "unit_si_factor": float(rules_v1.UNIT_SI[u]),
+            "h1_value": float(h1_val) if np.isfinite(h1_val) else None,
             "final_value": float(x["geo_value"]) if np.isfinite(x.get("geo_value", np.nan)) else None,
         }
 
@@ -1118,10 +1333,14 @@ def measure_video_instrumented(
             "tshift_already_applied": tshift_applied,
             "parse_record": r,
             "scene_ruler": {k: v for k, v in scene_ruler_entry.items() if k != "overlay_rgb"} if scene_ruler_entry else None,
-            "target_query_meta": {k: v for k, v in tgt.q.items() if k not in ("frames",)} if tgt is not None else None,
-            "prior_query_meta": {k: v for k, v in prior_tr.q.items() if k not in ("frames",)} if prior_tr is not None else None,
+            "target_query_meta": _extract_query_meta_for_replay(tgt.q) if tgt is not None else None,
+            "target2_query_meta": _extract_query_meta_for_replay(tgt2.q) if tgt2 is not None else None,
+            "target2_same_as_target": bool(tgt2 is not None and tgt is not None and tgt2 is tgt),
+            "prior_query_meta": _extract_query_meta_for_replay(prior_tr.q) if prior_tr is not None else None,
             "prior_same_as_target": bool(prior_tr is not None and tgt is not None and prior_tr is tgt),
+            "prior_same_as_target2": bool(prior_tr is not None and tgt2 is not None and prior_tr is tgt2),
             "companion_tracks_meta": companion_tracks_meta,
+            "extra_objs_meta": extra_objs_meta,
         }
 
         traces_by_id[rid] = {
@@ -1175,30 +1394,59 @@ def recompute_from_saved_trace_arrays(
     fidx = arrays["tgt_fidx"].astype(int).tolist()
     queries = []
     objs: dict[str, list[dict[str, Any]]] = {}
+    orig_oid_map: dict[int, int] = {}
     next_oid = 0
+    seen_keys: set[str | None] = set()
 
     def _add_query(q_meta: dict[str, Any] | None, prefix: str) -> int | None:
         nonlocal next_oid
         if q_meta is None:
             return None
+        qk = q_meta.get("key")
+        if qk in seen_keys:
+            return None
+        seen_keys.add(qk)
         sub = {k[len(prefix) + 1:]: v for k, v in arrays.items() if k.startswith(prefix + "_")}
+        if not sub:
+            return None
         q_rebuilt = _reconstruct_query_from_arrays(sub, q_meta)
         if vmeta.get("version") == "v2":
-            oid = next_oid
-            next_oid += 1
-            objs[str(oid)] = q_rebuilt.pop("frames")
+            orig_obj = q_meta.get("obj")
+            if orig_obj is not None and int(orig_obj) in orig_oid_map:
+                oid = orig_oid_map[int(orig_obj)]
+                q_rebuilt.pop("frames", None)
+            elif orig_obj is not None:
+                oid = next_oid
+                next_oid += 1
+                orig_oid_map[int(orig_obj)] = oid
+                objs[str(oid)] = q_rebuilt.pop("frames")
+            else:
+                oid = None
+                q_rebuilt.pop("frames", None)
             q_rebuilt["obj"] = oid
         queries.append(q_rebuilt)
         return len(queries) - 1
 
     _add_query(replay_spec.get("target_query_meta"), "tgt")
-    if not replay_spec.get("prior_same_as_target") and replay_spec.get("prior_query_meta") is not None:
-        p_key = replay_spec["prior_query_meta"].get("key")
-        t_key = (replay_spec.get("target_query_meta") or {}).get("key")
-        if p_key != t_key:
-            _add_query(replay_spec.get("prior_query_meta"), "prior")
+    if not replay_spec.get("target2_same_as_target") and replay_spec.get("target2_query_meta") is not None:
+        _add_query(replay_spec.get("target2_query_meta"), "tgt2")
+    if (
+        not replay_spec.get("prior_same_as_target")
+        and not replay_spec.get("prior_same_as_target2")
+        and replay_spec.get("prior_query_meta") is not None
+    ):
+        _add_query(replay_spec.get("prior_query_meta"), "prior")
     for comp in replay_spec.get("companion_tracks_meta", []):
         _add_query(comp["query_meta"], comp["slot"])
+    if vmeta.get("version") == "v2":
+        for ex in replay_spec.get("extra_objs_meta", []):
+            slot_ex = ex["slot"]
+            sub_ex = {k[len(slot_ex) + 1:]: v for k, v in arrays.items() if k.startswith(slot_ex + "_")}
+            if sub_ex:
+                q_ex = _reconstruct_query_from_arrays(sub_ex, ex["query_meta"])
+                oid = next_oid
+                next_oid += 1
+                objs[str(oid)] = q_ex.pop("frames")
 
     vj_rebuilt: dict[str, Any] = {
         "video_id": vmeta["video_id"],
@@ -1308,10 +1556,22 @@ def evaluate_xground_and_fuse(
     if (branch == "v2" and sr_v2) or (branch == "v3nt" and sr_v3):
         src = "sruler"
 
+    md_v2 = str((res_v2 or {}).get("mode") or "")
+    md_v3 = str((res_v3nt or {}).get("mode") or "")
+    if src == "sruler":
+        final_mode = "2d_ratio"
+    elif src in ("v", "xg_v"):
+        final_mode = ("vlm_" + md_v3) if md_v3 and not md_v3.startswith("vlm_") else md_v3
+    elif src == "d":
+        final_mode = md_v2
+    else:
+        final_mode = ""
+
     return {
         "final_value": val,
         "selected_branch": branch,
         "merge_src": src,
+        "final_mode": final_mode,
         "v2_value": gd,
         "v3nt_value": gv,
         "xground_flagged_roles": xg_flagged_roles,

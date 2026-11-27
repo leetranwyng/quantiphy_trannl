@@ -26,11 +26,17 @@ from solutions.iiixr.kaggle.kinematics import (
     run_scene_ruler_on_video,
 )
 from solutions.iiixr.kaggle.schema import (
+    ALL_2D_12_VIDEOS,
     EXPECTED_VIDEO_BY_ID,
     REPO_ROOT,
     SANITY_4_IDS,
+    STATIC_2D_11_VIDEOS,
+    STATIC_2D_41_IDS,
+    STATIC_2D_SCOPES,
+    TARGET_6_VIDEOS,
     TARGET_18_IDS,
     UPSTREAM_DIR,
+    VALID_SCOPES,
     FreshAntiCacheGuard,
     TraceStore,
     ensure_upstream_tree,
@@ -38,6 +44,7 @@ from solutions.iiixr.kaggle.schema import (
     extract_owl_threshold,
     fingerprint,
     load_cached_mot_val,
+    load_cached_val_geo_raw,
     load_validation_inference_inputs,
     probe_and_compare_video,
     read_caw_predictions_from_tar,
@@ -564,10 +571,11 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                         "created_at": utc_now_iso(),
                     },
                 )
+                err_prefix = "iiixr_2d_static" if scope in STATIC_2D_SCOPES else "iiixr_box"
                 archives = _package_tar_archives(
                     run_dir=run_dir,
                     output_dir=args.output,
-                    base_archive_name=f"iiixr_box_{mode}.tar",
+                    base_archive_name=f"{err_prefix}_{mode}.tar",
                     budget_bytes=int(args.output_budget_gib * GIB),
                 )
             except Exception:
@@ -598,6 +606,8 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
             ],
         }
         write_json_atomic(args.output / "iiixr_summary.json", err_summary)
+        if scope in STATIC_2D_SCOPES:
+            write_json_atomic(args.output / "iiixr_2d_static_summary.json", err_summary)
         write_json_atomic(run_dir / "summary.json", err_summary)
         return err_summary
 
@@ -630,7 +640,16 @@ def _execute_workflow_inner(
     _write_environment_and_config_diff(run_dir, mode, dtype_profile, devices)
 
     # Determine video list first
-    prelim_videos = list({"sanity4": ["simulation_0163", "simulation_0089", "internet_0019"]}.get(scope, snaps["dataset"]["target_videos"].keys()))
+    prelim_videos_map = {
+        "sanity4": ["simulation_0163", "simulation_0089", "internet_0019"],
+        "target18": list(TARGET_6_VIDEOS),
+        "survey158": list(TARGET_6_VIDEOS),
+        "static2d_sanity": ["internet_0001", "internet_0027", "simulation_0163"],
+        "static2d_41": list(STATIC_2D_11_VIDEOS),
+        "static2d_survey158": list(STATIC_2D_11_VIDEOS),
+        "all2d_69": list(ALL_2D_12_VIDEOS),
+    }
+    prelim_videos = prelim_videos_map.get(scope, list(TARGET_6_VIDEOS))
     assets = _ensure_hf_assets(
         cache_dir=args.cache,
         dataset_dir_arg=args.dataset_dir,
@@ -757,10 +776,17 @@ def _execute_workflow_inner(
             prelim_parsed = parse_questions_v1_v2(all_context_rows, llm_outputs_by_id={})
             abort_gpu_pipeline = False
 
-            # Sanity Check: Trace OFF vs Trace ON parity on #399 (simulation_0163)
-            if mode == "sanity" and not args.skip_parity_check and "simulation_0163" in selected_videos:
-                v_0163_v1 = [prelim_parsed["v1_records"][r["id"]] for r in inputs["video_context_rows"]["simulation_0163"]]
-                v_0163_v2 = [prelim_parsed["v2_records"][r["id"]] for r in inputs["video_context_rows"]["simulation_0163"]]
+            # Sanity Check: Trace OFF vs Trace ON parity (#2272 on internet_0027 for 2D static, #399 on simulation_0163 for 2D motion)
+            parity_vid, parity_qid = (None, None)
+            if mode == "sanity" and not args.skip_parity_check:
+                if scope == "static2d_sanity" and "internet_0027" in selected_videos:
+                    parity_vid, parity_qid = ("internet_0027", 2272)
+                elif "simulation_0163" in selected_videos:
+                    parity_vid, parity_qid = ("simulation_0163", 399)
+
+            if parity_vid is not None and parity_qid is not None:
+                v_par_v1 = [prelim_parsed["v1_records"][r["id"]] for r in inputs["video_context_rows"][parity_vid]]
+                v_par_v2 = [prelim_parsed["v2_records"][r["id"]] for r in inputs["video_context_rows"][parity_vid]]
                 parity_vals = []
                 parity_errors: list[dict[str, Any]] = []
                 for tr_flag, sfx in ((False, "trace_off"), (True, "trace_on")):
@@ -771,11 +797,11 @@ def _execute_workflow_inner(
                         work_dir=work_dir / "parity",
                         run_id=f"{run_id}-{sfx}",
                         video_items=[{
-                            "video_id": "simulation_0163",
-                            "video_path": str(assets["video_paths"]["simulation_0163"]),
-                            "fps": csv_fps_by_vid["simulation_0163"],
-                            "parse_v1_records": v_0163_v1,
-                            "parse_v2_records": v_0163_v2,
+                            "video_id": parity_vid,
+                            "video_path": str(assets["video_paths"][parity_vid]),
+                            "fps": csv_fps_by_vid[parity_vid],
+                            "parse_v1_records": v_par_v1,
+                            "parse_v2_records": v_par_v2,
                             "vlm_ground_records": [],
                             "attempt": 1,
                         }],
@@ -789,30 +815,30 @@ def _execute_workflow_inner(
                         seed=0,
                         tag_suffix=sfx,
                     )
-                    if p_res["errors"] or "simulation_0163" not in p_res["video_results"]:
+                    if p_res["errors"] or parity_vid not in p_res["video_results"]:
                         errs_here = [
                             {"phase": f"preflight_parity_{sfx}", **e}
-                            for e in (p_res["errors"] or [{"stage": "preflight_parity", "video_id": "simulation_0163", "error": "Missing simulation_0163 result"}])
+                            for e in (p_res["errors"] or [{"stage": "preflight_parity", "video_id": parity_vid, "error": f"Missing {parity_vid} result"}])
                         ]
                         parity_errors.extend(errs_here)
                         stage_errors.extend(errs_here)
                         abort_gpu_pipeline = True
                         break
-                    vb = p_res["video_results"]["simulation_0163"]
+                    vb = p_res["video_results"][parity_vid]
                     active_tj = vb["track_v2"] if vb.get("track_v2") is not None else vb["track_v1"]
                     m_out = measure_video_instrumented(
-                        video_recs=v_0163_v2,
+                        video_recs=v_par_v2,
                         vj=active_tj,
                         t_owl=owl_info["T_owl"],
                         scene_ruler_entry=vb.get("scene_ruler"),
-                        target_question_ids={399},
+                        target_question_ids={parity_qid},
                     )
-                    parity_vals.append(float(m_out["results_by_id"][399]["geo_value"]))
+                    parity_vals.append(float(m_out["results_by_id"][parity_qid]["geo_value"]))
 
                 if parity_errors:
                     sanity_parity_report = {
-                        "sample_id": 399,
-                        "video_id": "simulation_0163",
+                        "sample_id": parity_qid,
+                        "video_id": parity_vid,
                         "status": "error",
                         "trace_off_value": parity_vals[0] if len(parity_vals) >= 1 else None,
                         "trace_on_value": parity_vals[1] if len(parity_vals) >= 2 else None,
@@ -822,8 +848,8 @@ def _execute_workflow_inner(
                 else:
                     parity_ok = len(parity_vals) == 2 and math.isclose(parity_vals[0], parity_vals[1], rel_tol=0.0, abs_tol=1e-12)
                     sanity_parity_report = {
-                        "sample_id": 399,
-                        "video_id": "simulation_0163",
+                        "sample_id": parity_qid,
+                        "video_id": parity_vid,
                         "status": "ok" if parity_ok else "mismatch",
                         "trace_off_value": parity_vals[0],
                         "trace_on_value": parity_vals[1],
@@ -1120,9 +1146,17 @@ def _execute_workflow_inner(
     all_events = []
     if (run_dir / "events.jsonl").is_file():
         all_events = [json.loads(ln) for ln in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
-    cache_map = load_cached_mot_val(UPSTREAM_DIR, TARGET_18_IDS)
+    in_scope_ids_tuple = tuple(
+        sorted(int(r["id"]) for r in per_q_rows if str(r.get("in_scope_2d_motion", "")).lower() == "true")
+    )
+    if scope in STATIC_2D_SCOPES:
+        cache_map = load_cached_val_geo_raw(UPSTREAM_DIR, target_ids=in_scope_ids_tuple or STATIC_2D_41_IDS)
+        if scope == "all2d_69":
+            cache_map.update(load_cached_mot_val(UPSTREAM_DIR, TARGET_18_IDS))
+    else:
+        cache_map = load_cached_mot_val(UPSTREAM_DIR, TARGET_18_IDS)
     caw_map = (
-        read_caw_predictions_from_tar(args.caw_tar, TARGET_18_IDS)
+        read_caw_predictions_from_tar(args.caw_tar, in_scope_ids_tuple or TARGET_18_IDS)
         if (args.caw_tar and args.caw_tar.is_file())
         else {}
     )
@@ -1168,9 +1202,17 @@ def _execute_workflow_inner(
     if stage_errors:
         run_status = "ERROR"
     elif mode == "sanity":
-        all_ok = all(p["status"] == "ok" for p in predictions_out if p["in_scope_2d_motion"])
         parity_pass = True if sanity_parity_report is None else bool(sanity_parity_report["identical_trace_off_on"])
-        run_status = "PASS" if (all_ok and parity_pass) else "FAIL"
+        if scope == "static2d_sanity":
+            no_error_rows = all(p["status"] != "error" for p in predictions_out if p["in_scope_2d_motion"])
+            must_ok_ids = {2151, 2152, 2272, 2275} & {int(p["id"]) for p in predictions_out if p["in_scope_2d_motion"]}
+            expected_ok = bool(must_ok_ids) and all(
+                p["status"] == "ok" for p in predictions_out if int(p["id"]) in must_ok_ids
+            )
+            run_status = "PASS" if (no_error_rows and expected_ok and parity_pass) else "FAIL"
+        else:
+            all_ok = all(p["status"] == "ok" for p in predictions_out if p["in_scope_2d_motion"])
+            run_status = "PASS" if (all_ok and parity_pass) else "FAIL"
 
     run_meta = {
         "run_id": run_id,
@@ -1208,7 +1250,8 @@ def _execute_workflow_inner(
     )
     verification = json.loads(verify_out_raw)
 
-    archive_name = f"iiixr_box_{mode}.tar"
+    archive_prefix = "iiixr_2d_static" if scope in STATIC_2D_SCOPES else "iiixr_box"
+    archive_name = f"{archive_prefix}_{mode}.tar"
     archives = []
     if not args.no_tar:
         archives = _package_tar_archives(
@@ -1238,15 +1281,17 @@ def _execute_workflow_inner(
         "stage_errors": stage_errors,
     }
     write_json_atomic(args.output / "iiixr_summary.json", summary)
+    if scope in STATIC_2D_SCOPES:
+        write_json_atomic(args.output / "iiixr_2d_static_summary.json", summary)
     write_json_atomic(run_dir / "summary.json", summary)
     return summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="IIIXR g_box reproduction, trace, and Kaggle 2xT4 runner")
+    ap = argparse.ArgumentParser(description="IIIXR 2D reproduction, trace, and Kaggle 2xT4 runner")
     is_kaggle_linux = os.name != "nt" and Path("/kaggle/working").is_dir()
     ap.add_argument("mode", choices=["replay", "sanity", "full"])
-    ap.add_argument("--scope", choices=["sanity4", "target18", "survey158"], default=None)
+    ap.add_argument("--scope", choices=list(VALID_SCOPES), default=None)
     ap.add_argument("--cache", type=Path, default=Path("/kaggle/temp/iiixr") if is_kaggle_linux else REPO_ROOT / "outputs" / "iiixr_cache")
     ap.add_argument("--output", type=Path, default=Path("/kaggle/working") if is_kaggle_linux else REPO_ROOT / "outputs" / "iiixr")
     ap.add_argument("--run-dir", type=Path, default=None)

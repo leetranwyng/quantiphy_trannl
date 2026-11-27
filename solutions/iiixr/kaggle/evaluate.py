@@ -11,9 +11,12 @@ import numpy as np
 
 from solutions.iiixr.kaggle.schema import (
     EXPECTED_VIDEO_BY_ID,
+    STATIC_2D_41_IDS,
+    STATIC_2D_SCOPES,
     TARGET_18_IDS,
     UPSTREAM_DIR,
     load_cached_mot_val,
+    load_cached_val_geo_raw,
     load_validation_ground_truth,
     read_caw_predictions_from_tar,
     read_json,
@@ -71,12 +74,24 @@ def evaluate_sealed_predictions(
     preds_list: list[dict[str, Any]] = locked["predictions"]
 
     gt_by_id = load_validation_ground_truth(validation_csv_path)
-    cache_by_id = load_cached_mot_val(upstream_dir, TARGET_18_IDS)
+    in_scope_ids = tuple(
+        sorted(
+            int(p["id"])
+            for p in preds_list
+            if bool(p.get("in_scope", p.get("in_scope_2d_motion", int(p["id"]) in EXPECTED_VIDEO_BY_ID)))
+        )
+    )
+    if scope in STATIC_2D_SCOPES:
+        cache_by_id = load_cached_val_geo_raw(upstream_dir, target_ids=in_scope_ids or STATIC_2D_41_IDS)
+        if scope == "all2d_69":
+            mot_cache = load_cached_mot_val(upstream_dir, TARGET_18_IDS)
+            cache_by_id.update(mot_cache)
+    else:
+        cache_by_id = load_cached_mot_val(upstream_dir, TARGET_18_IDS)
 
     caw_by_id: dict[int, dict[str, Any]] = {}
     caw_source_info: dict[str, Any] = {"available": False, "path": None}
     if caw_tar_path is not None and caw_tar_path.is_file():
-        in_scope_ids = tuple(sorted(int(p["id"]) for p in preds_list if int(p["id"]) in EXPECTED_VIDEO_BY_ID))
         if in_scope_ids:
             caw_by_id = read_caw_predictions_from_tar(caw_tar_path, target_ids=in_scope_ids)
             caw_source_info = {
@@ -92,7 +107,7 @@ def evaluate_sealed_predictions(
     for p_rec in preds_list:
         qid = int(p_rec["id"])
         vid = str(p_rec["video_id"]).strip()
-        in_scope = bool(p_rec.get("in_scope_2d_motion", qid in EXPECTED_VIDEO_BY_ID))
+        in_scope = bool(p_rec.get("in_scope", p_rec.get("in_scope_2d_motion", qid in EXPECTED_VIDEO_BY_ID)))
         gt = _finite_or_none(gt_by_id.get(qid))
 
         cache_rec = cache_by_id.get(qid)
@@ -115,11 +130,13 @@ def evaluate_sealed_predictions(
             if (abs_vs_cache is not None and cached_box is not None)
             else None
         )
-        match_cache = bool(
+        both_finite_close = (
             fresh_val is not None
             and cached_box is not None
             and math.isclose(fresh_val, cached_box, rel_tol=DIAG_RTOL, abs_tol=DIAG_ATOL)
         )
+        both_abstained = fresh_val is None and cached_box is None and status in ("fail", "abstain")
+        match_cache = bool(both_finite_close or both_abstained)
 
         abs_vs_gt = abs(fresh_val - gt) if (fresh_val is not None and gt is not None) else None
         rel_vs_gt = abs_vs_gt / max(abs(gt), 1e-12) if (abs_vs_gt is not None and gt is not None) else None
@@ -128,7 +145,10 @@ def evaluate_sealed_predictions(
         rel_cache_vs_gt = abs_cache_vs_gt / max(abs(gt), 1e-12) if (abs_cache_vs_gt is not None and gt is not None) else None
 
         mra_cache = compute_row_mra(cached_box, gt) if in_scope else None
-        mra_pt = compute_row_mra(cached_pt, gt) if in_scope else None
+        if scope in STATIC_2D_SCOPES and cached_pt is None:
+            mra_pt = None
+        else:
+            mra_pt = compute_row_mra(cached_pt, gt) if in_scope else None
         mra_fresh = compute_row_mra(fresh_val, gt) if (in_scope and mode != "replay") else None
         mra_caw = compute_row_mra(caw_val, gt) if (in_scope and caw_source_info["available"]) else None
 
@@ -191,6 +211,8 @@ def evaluate_sealed_predictions(
             "delta_mra_cache_vs_caw": delta_cache_caw,
             "mpp": _finite_or_none(p_rec.get("mpp")),
             "px_quantity": _finite_or_none(p_rec.get("px_quantity")),
+            "cached_mode": cache_rec.get("mode_box", "") if cache_rec else "",
+            "cached_why": cache_rec.get("why", "") if cache_rec else "",
             "question": p_rec.get("question", ""),
             "prior_text": p_rec.get("prior_text", ""),
         })
@@ -207,7 +229,8 @@ def evaluate_sealed_predictions(
     in_scope_rows = [r for r in csv_rows if r["in_scope_2d_motion"]]
     denom = len(in_scope_rows)
     mean_mra_cache = float(np.mean([r["mra_cached_box"] for r in in_scope_rows])) if denom else 0.0
-    mean_mra_pt = float(np.mean([r["mra_cached_point"] for r in in_scope_rows])) if denom else 0.0
+    pt_vals = [r["mra_cached_point"] for r in in_scope_rows if r["mra_cached_point"] is not None]
+    mean_mra_pt = float(np.mean(pt_vals)) if pt_vals else (0.0 if scope not in STATIC_2D_SCOPES else None)
     mean_mra_caw = (
         float(np.mean([r["mra_caw"] for r in in_scope_rows]))
         if (denom and caw_source_info["available"])
@@ -221,6 +244,13 @@ def evaluate_sealed_predictions(
 
     n_covered_fresh = sum(int(r["coverage"]) for r in in_scope_rows)
     n_match_cache = sum(1 for r in in_scope_rows if r["match_cache_tol"] is True)
+    n_vids_in_scope = len({r["video_id"] for r in in_scope_rows})
+    if scope == "all2d_69":
+        subset_label = f"{denom} 2D static + motion questions ({n_vids_in_scope} videos)"
+    elif scope in STATIC_2D_SCOPES:
+        subset_label = f"{denom} 2D static questions (SS + DS across {n_vids_in_scope} videos)"
+    else:
+        subset_label = f"{denom} 2D motion reference questions ({n_vids_in_scope} videos)"
 
     summary_eval = {
         "evaluated_at": utc_now_iso(),
@@ -228,7 +258,7 @@ def evaluate_sealed_predictions(
         "scope": scope,
         "locked_predictions_sha256": locked_sha,
         "benchmark_scope_notice": (
-            f"Mean per-question MRA over {denom} 2D motion reference questions (6 videos). "
+            f"Mean per-question MRA over {subset_label}. "
             "Failed or missing fresh predictions receive MRA=0.0 and remain in the denominator. "
             "Do NOT compare this subset mean directly with 158-question validation macro-MRA or full fusion leaderboard scores."
         ),

@@ -94,7 +94,11 @@ def launch(source: Path, mode: str, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def show_summary(summary: dict[str, Any]) -> None:
-    print(f"=== IIIXR g_box · {summary['mode'].upper()} · {summary['status']} ===")
+    scope = str(summary.get("scope", ""))
+    is_static = scope in ("static2d_sanity", "static2d_41", "static2d_survey158", "all2d_69")
+    label = "IIIXR 2D Static" if is_static else "IIIXR g_box"
+    print(f"=== {label} · {summary['mode'].upper()} · {summary['status']} ===")
+    print(f"Scope                  : {scope}")
     print(f"Resolved Source Commit : {summary.get('source_commit')}")
     print(f"Pinned Upstream Commit : {summary.get('upstream_commit')}")
     print(f"Run Directory          : {summary.get('run_dir')}")
@@ -108,7 +112,8 @@ def show_summary(summary: dict[str, Any]) -> None:
         print(json.dumps(first, indent=2, ensure_ascii=False))
 
     ev = summary.get("evaluation") or {}
-    print("\nMean per-question MRA (2D motion subset):")
+    subset_desc = "2D static subset" if is_static else "2D motion subset"
+    print(f"\nMean per-question MRA ({subset_desc}):")
     print(json.dumps(ev.get("mean_per_question_mra", {}), indent=2))
 
     pq = Path(summary.get("per_question_csv", ""))

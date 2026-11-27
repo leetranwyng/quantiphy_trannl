@@ -138,7 +138,46 @@ python -m solutions.iiixr.kaggle.workflow full \
 
 Để khảo sát độ phủ toàn bộ 158/159 câu validation (đánh dấu `unsupported` cho các câu 3D hoặc bài toán tĩnh ngoài phạm vi 18 câu): thêm `--scope survey158`.
 
-### 3.4 Chạy kiểm chứng độc lập trên CPU sau khi giải nén archive
+### 3.4 Nhánh 2D Static (`SS` + `DS`: 41 câu / 11 video trên Kaggle GPU T4 ×2)
+
+Ngoài 18 câu chuyển động 2D (`g_box`), cùng bộ 4 model đã pin (`Qwen3-VL-8B-Instruct`, `grounding-dino-base`, `owlv2-base-patch16-ensemble`, `sam2.1-hiera-large` + `scene_ruler`) hỗ trợ trực tiếp toàn bộ nhánh **đo kích thước, khoảng cách hai vật & đường kính quỹ đạo 2D tĩnh (`2d_ratio` / `sruler` / `vlm_2d_ratio`)** gồm **41 câu** (`12 SS` + `29 DS`) trên **11 video** (`internet_0001, internet_0004, internet_0005, internet_0013, internet_0019, internet_0027, simulation_0089, simulation_0098_segmented, simulation_0163, simulation_0193, simulation_0196`):
+
+- **Công thức đo hình học 2D tĩnh (`geo/measure_v3.py`):**
+  - `size` (`ext_px` + `agg_ext`): lấy bách phân vị 75 (`np.percentile(vs, 75)`) trên các frame mask không chạm biên (`oke = ok & (border == 0)`), sử dụng kích thước hộp bao trục đứng/ngang hoặc `cv2.minAreaRect` (`rr`), kèm luật vật thể có cánh (`WINGED`: `bird`, `eagle`, ... dùng `percentile 90` của trục dài hơn cho `width`).
+  - `dist2` (`dist2_px` + `_poly_dist`): khoảng cách tâm-tới-tâm giữa hai vật thể tại thời điểm `t` / `when` (`start`, `end`, `min`, `max`), tự động hiệu chỉnh sang khoảng cách cạnh-tới-cạnh bằng đa giác đường bao mask (`poly`) khi `g < 0.5 * c` hoặc `minimum=True`, hỗ trợ gán màu `Video.colour_assign` và đối tượng cùng loại thứ hai (`second_fix`).
+  - `orbitdiam`: đường kính quỹ đạo `2 * median(||p(t) - center||_2)` quanh vật trung tâm (ví dụ các mặt trăng Sao Mộc trên `simulation_0193`, kết hợp `vlm_ground --notext` → `v3nt`).
+  - Chốt chặn hợp lý 2 bậc độ lớn (`arbitrate_v2.py` + `tools/heuristic.py` `H1 prior`) trên mọi đơn vị (`mm`, `cm`, `m`, `km`).
+- **Mốc tham chiếu Replay (đã kiểm chứng trên 41 câu):**
+  - `cached_box` (`preds/val_geo_v4ntrj5sQ2srngsr_d_vw_raw.csv`): độ phủ `29/41`, mean per-question MRA = **`0.5293`** (`0.5292682927`).
+  - `caw` (`quantiphy_full.tar:run/predictions.csv`): `41/41`, mean per-question MRA = **`0.5122`** (`0.5121951220`).
+- **Notebooks & CLI tương ứng:**
+  - Sanity (`6` câu `#2151, #2152, #2272, #2275, #402, #403` / `3` video + đối chứng trace trên `#2272`): `solutions/iiixr/kaggle/iiixr_2d_static_sanity_t4.ipynb`
+  - Full (`41` câu / `11` video, xuất `iiixr_2d_static_full.tar`): `solutions/iiixr/kaggle/iiixr_2d_static_full_t4.ipynb`
+
+```bash
+# Replay CPU cho 41 câu 2D Static (kiểm chứng MRA 0.5293 vs CAW 0.5122):
+python -m solutions.iiixr.kaggle.workflow replay \
+  --scope static2d_41 \
+  --caw-tar quantiphy_full.tar \
+  --output outputs/iiixr_static2d_replay \
+  --no-tar
+
+# Sanity 6 câu 2D Static trên Kaggle GPU T4 x2:
+python -m solutions.iiixr.kaggle.workflow sanity \
+  --scope static2d_sanity \
+  --cache /kaggle/temp/iiixr \
+  --output /kaggle/working \
+  --dtype-profile t4_fp16
+
+# Full 41 câu 2D Static trên Kaggle GPU T4 x2 (hoặc đổi --scope all2d_69 để gộp cả 69 câu 2D):
+python -m solutions.iiixr.kaggle.workflow full \
+  --scope static2d_41 \
+  --cache /kaggle/temp/iiixr \
+  --output /kaggle/working \
+  --dtype-profile t4_fp16
+```
+
+### 3.5 Chạy kiểm chứng độc lập trên CPU sau khi giải nén archive
 
 ```bash
 tar -xf iiixr_box_full.tar

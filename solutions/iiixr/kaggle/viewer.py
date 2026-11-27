@@ -43,6 +43,7 @@ def build_viewer_payload_for_question(
     track_overlays_by_variant: dict[str, Any] = {}
     if video_track_bundle and parse_trace:
         tgt_ent = parse_trace.get("target") or {}
+        t2_ent = parse_trace.get("target2") or {}
         pr_ent = parse_trace.get("prior_obj") or {}
 
         def _ent_key(e: dict[str, Any] | None) -> str | None:
@@ -52,6 +53,7 @@ def build_viewer_payload_for_question(
             return e["phrase"] + "|" + ",".join(e.get("where") or []) + ("|" + rel[0] + ":" + rel[1] if rel else "")
 
         t_key = _ent_key(tgt_ent)
+        t2_key = _ent_key(t2_ent)
         p_key = _ent_key(pr_ent)
 
         for var_name, tj_key in (("v2", "track_v2"), ("v1", "track_v1"), ("v3nt", "track_v3nt")):
@@ -91,6 +93,7 @@ def build_viewer_payload_for_question(
 
             # For gravity videos (e.g., internet_0019 where prior phrase is None), find target as reference too
             tq = q_map.get(t_key) if t_key else None
+            t2q = q_map.get(t2_key) if t2_key else None
             pq = q_map.get(p_key) if p_key else None
             track_overlays_by_variant[var_name] = {
                 "W": W,
@@ -98,10 +101,13 @@ def build_viewer_payload_for_question(
                 "fps": fps,
                 "fidx": fidx,
                 "target_key": t_key,
+                "target2_key": t2_key,
                 "prior_key": p_key,
                 "target_anchor": tq.get("anchor") if tq else None,
+                "target2_anchor": t2q.get("anchor") if t2q else None,
                 "prior_anchor": pq.get("anchor") if pq else None,
                 "target_frames": _extract_obj_frames(tq),
+                "target2_frames": _extract_obj_frames(t2q) if (t2q and t2_key != t_key) else None,
                 "prior_frames": _extract_obj_frames(pq) if (pq and p_key != t_key) else None,
             }
 
@@ -142,7 +148,9 @@ def render_failure_analysis_html(
         ensure_ascii=False,
     ).replace("</", "<\\/")
 
-    title_str = f"IIIXR g_box Failure Analysis · {escape(str(run_meta.get('mode', 'run')).upper())} · {escape(str(run_meta.get('run_id', '')))}"
+    scope_val = str(run_meta.get("scope", ""))
+    branch_title = "IIIXR 2D Static" if scope_val in ("static2d_sanity", "static2d_41", "static2d_survey158", "all2d_69") else "IIIXR g_box"
+    title_str = f"{branch_title} Failure Analysis · {escape(str(run_meta.get('mode', 'run')).upper())} · {escape(str(run_meta.get('run_id', '')))}"
 
     html = f"""<!DOCTYPE html>
 <html lang="vi">
@@ -464,11 +472,12 @@ def render_failure_analysis_html(
     `Source SHA: ${{meta.source_commit || "uncommitted"}} · Upstream IIIXR: ${{(meta.upstream_commit || "").slice(0, 12)}} · Mode: ${{meta.mode}}`;
   const mraMap = evSum.mean_per_question_mra || {{}};
   const sGrid = document.getElementById("summaryGrid");
+  const isStaticScope = ["static2d_sanity", "static2d_41", "static2d_survey158", "all2d_69"].includes(String(meta.scope || ""));
   const cardsSummary = [
-    ["Mode & Scope", `${{(meta.mode || "").toUpperCase()}} (${{evSum.denominator_questions || questions.length}} câu 2D)`, `Dtype profile: ${{meta.dtype_profile || "cpu_replay"}}`],
-    ["Mean MRA · cached_box", fmt(mraMap.cached_box, 4), "18 g_box từ cache IIIXR (tham chiếu ~0.8389)"],
+    ["Mode & Scope", `${{(meta.mode || "").toUpperCase()}} · ${{meta.scope || ""}} (${{evSum.denominator_questions || questions.length}} câu)`, `Dtype profile: ${{meta.dtype_profile || "cpu_replay"}}`],
+    ["Mean MRA · cached_box", fmt(mraMap.cached_box, 4), isStaticScope ? "Từ cache IIIXR val_geo_raw (41 câu 2D static ~0.5293)" : "18 g_box từ cache IIIXR (tham chiếu ~0.8389)"],
     ["Mean MRA · fresh_box", mraMap.fresh_box !== null && mraMap.fresh_box !== undefined ? fmt(mraMap.fresh_box, 4) : "Chưa chạy GPU fresh", evSum.fresh_coverage ? `Coverage: ${{evSum.fresh_coverage.generated_ok}}/${{evSum.fresh_coverage.denominator}}` : "Chế độ replay cache"],
-    ["Mean MRA · CAW baseline", mraMap.caw !== null && mraMap.caw !== undefined ? fmt(mraMap.caw, 4) : "Chưa gắn TAR", "Từ quantiphy_full.tar (tham chiếu ~0.4278)"],
+    ["Mean MRA · CAW baseline", mraMap.caw !== null && mraMap.caw !== undefined ? fmt(mraMap.caw, 4) : "Chưa gắn TAR", isStaticScope ? "Từ quantiphy_full.tar (41 câu 2D static ~0.5122)" : "Từ quantiphy_full.tar (tham chiếu ~0.4278)"],
     ["Khớp cache (atol=1e-6, rtol=1e-4)", evSum.cache_parity_diagnostics && evSum.cache_parity_diagnostics.matched_count !== null ? `${{evSum.cache_parity_diagnostics.matched_count}} / ${{evSum.denominator_questions}}` : "N/A (replay)", "Mốc chẩn đoán sai lệch số học"]
   ];
   sGrid.innerHTML = cardsSummary.map(([lbl, val, sub]) => `
@@ -691,6 +700,7 @@ def render_failure_analysis_html(
             </div>
             <div class="legend">
               <span><i class="dot" style="background:#38bdf8"></i>Target object (box + mask + tâm c)</span>
+              <span><i class="dot" style="background:#34d399"></i>Target 2 (dist2)</span>
               <span><i class="dot" style="background:#facc15"></i>Reference / Prior (hoặc vạch làn đường)</span>
               <span><i class="dot" style="background:#f87171"></i>Thời điểm câu hỏi yêu cầu</span>
               <span><i class="dot" style="background:#c084fc"></i>Quỹ đạo smoothed (derived)</span>
@@ -1019,7 +1029,21 @@ def render_failure_analysis_html(
       }}
 
       drawEntity(ov.prior_frames, "rgba(250, 204, 21, 1)", `ref: ${{ov.prior_key || ""}}`);
+      drawEntity(ov.target2_frames, "rgba(52, 211, 153, 1)", `tgt2: ${{ov.target2_key || ""}}`);
       drawEntity(ov.target_frames, "rgba(56, 189, 248, 1)", `tgt: ${{ov.target_key || ""}}`);
+      if (bestD <= 1 && ov.target_frames && ov.target2_frames && ov.target_frames[slot] && ov.target2_frames[slot] && ov.target_frames[slot].c && ov.target2_frames[slot].c) {{
+        const c1 = ov.target_frames[slot].c;
+        const c2 = ov.target2_frames[slot].c;
+        ctx.save();
+        ctx.strokeStyle = "#34d399";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(c1[0], c1[1]);
+        ctx.lineTo(c2[0], c2[1]);
+        ctx.stroke();
+        ctx.restore();
+      }}
     }}
 
     function setFrame(fIdx) {{

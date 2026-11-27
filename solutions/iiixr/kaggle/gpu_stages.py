@@ -849,17 +849,19 @@ def _build_track_v1(
         else:
             alias[qi] = hit[0]
 
-    tr0, sam_meta = _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile) if uniq else ({}, {"skipped": True})
+    tr0, sam_meta = (
+        _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile, keep_all_polys=False)
+        if uniq
+        else ({}, {"skipped": True})
+    )
     tr = {qi: tr0.get(alias[qi], {}) for qi in alias}
 
     for qi, q in enumerate(qs):
         d = tr.get(qi, {})
         q["frames"] = []
         for j in range(len(frames)):
-            st, lg, poly, _ = d.get(j, (None, -99.0, None, None))
+            st, lg, _poly, _ = d.get(j, (None, -99.0, None, None))
             entry: dict[str, Any] = {"st": st, "lg": round(lg, 2)}
-            if poly is not None:
-                entry["poly"] = poly
             q["frames"].append(entry)
         ious = []
         for k, fi in enumerate(di):
@@ -934,7 +936,17 @@ def _build_track_v2(
             else:
                 alias[(name, qi)] = hit[0]
 
-    tr, sam_meta = _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile) if uniq else ({}, {"skipped": True})
+    need_poly = {
+        alias[(name, qi)]
+        for name in ("d", "e")
+        for qi, _fi, _b in cfg[name][1]
+        if "dist" in qs[qi]["roles"]
+    }
+    tr, sam_meta = (
+        _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile, keep_all_polys=bool(need_poly))
+        if uniq
+        else ({}, {"skipped": True})
+    )
 
     objs: dict[str, list[dict[str, Any]]] = {}
     for oid, _, _ in uniq:
@@ -943,7 +955,7 @@ def _build_track_v2(
         for j in range(len(frames)):
             st, lg, poly, col = d.get(j, (None, -99.0, None, None))
             e_item: dict[str, Any] = {"st": st, "lg": round(lg, 2)}
-            if poly is not None:
+            if poly is not None and oid in need_poly:
                 e_item["poly"] = poly
             if col is not None:
                 e_item["col"] = col
@@ -1093,7 +1105,12 @@ def _build_track_v3nt(
         else:
             alias[k] = hit[0]
 
-    tr, sam_meta = _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile) if uniq else ({}, {"skipped": True})
+    need_poly = {alias[k] for k, q in Q.items() if k in alias and "dist" in q["roles"]}
+    tr, sam_meta = (
+        _run_sam2_instrumented(frames, uniq, sam2_dir, dtype_profile=dtype_profile, keep_all_polys=bool(need_poly))
+        if uniq
+        else ({}, {"skipped": True})
+    )
     objs: dict[str, list[dict[str, Any]]] = {}
     for oid, _, _ in uniq:
         d = tr.get(oid, {})
@@ -1101,7 +1118,7 @@ def _build_track_v3nt(
         for j in range(len(frames)):
             st, lg, poly, col = d.get(j, (None, -99.0, None, None))
             e_item: dict[str, Any] = {"st": st, "lg": round(lg, 2)}
-            if poly is not None:
+            if poly is not None and oid in need_poly:
                 e_item["poly"] = poly
             if col is not None:
                 e_item["col"] = col
