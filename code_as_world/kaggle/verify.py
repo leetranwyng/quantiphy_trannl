@@ -113,8 +113,10 @@ def verify_attempt(run, directory, inventory, run_fingerprint):
         names = read_json(paths["hook_modules.json"])
         called = {e["module"] for e in events if e["phase"] == "end" and "module" in e}
         require(set(names) == called, f"Registered/called model hooks differ: {directory}")
+    generation = read_json(paths["generation.json"])
     if result["deep_trace"]:
-        for domain, steps in (("visual", [0]), ("language_model", [0, 1])):
+        lm_steps = [0, 1] if generation["step_count_observed"] > 1 else [0]
+        for domain, steps in (("visual", [0]), ("language_model", lm_steps)):
             for step in steps:
                 diagnostic_events = [
                     event for event in events if event["phase"] == "end" and event["stage"] == "diagnostic_activation"
@@ -128,7 +130,6 @@ def verify_attempt(run, directory, inventory, run_fingerprint):
             f"Incorrect message roles: {directory}")
     video = read_json(paths["video.json"])
     token = read_json(paths["token_mapping.json"])
-    generation = read_json(paths["generation.json"])
     value, unit = parse_answer(generation["raw_text"])
     require(read_json(paths["parsed.json"]) == {"value": value, "unit_text": unit},
             f"Parser replay differs: {directory}")

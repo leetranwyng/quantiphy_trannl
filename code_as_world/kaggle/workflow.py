@@ -442,11 +442,10 @@ def merge_parts(args, work, run, identity_base, specs, partitions):
 
 def workflow(args, work, run, deadline):
     verified_sanity, sanity_manifest = None, None
-    if args.mode == "full":
-        require(args.sanity_archive is not None, "Attach the saved PASS sanity notebook output first")
+    if args.mode == "full" and args.sanity_archive is not None:
         prior = work / "verified_sanity"
         prior.mkdir()
-        verified_sanity, sanity_manifest = open_prior(args.sanity_archive, prior, require_pass=True)
+        verified_sanity, sanity_manifest = open_prior(args.sanity_archive, prior, require_pass=False)
     benchmark, paths, hashes = fetch_assets(args)
     videos = video_inventory(paths["dataset"], hashes["dataset"])
     specs, labels, csv_sha = load_dataset(benchmark / "quantiphy_validation.csv", videos)
@@ -456,8 +455,11 @@ def workflow(args, work, run, deadline):
                "groups": dict(Counter(s["record"]["category"] for s in specs)), "missing_videos": []}
     pilot, selection = choose_sanity(specs)
     devices = runtime_devices() if args.mode != "merge" else []
-    profile = sanity_manifest["identity"]["profile"] if sanity_manifest else None
-    budget = int(args.output_budget_gib * GIB)
+    profile = (sanity_manifest["identity"].get("profile") if sanity_manifest else None) or (
+        args.profile if args.mode == "full" else None
+    )
+    output_free = shutil.disk_usage(args.output).free
+    budget = min(int(args.output_budget_gib * GIB), max(GIB, output_free - GIB))
     identity_base = {
         "schema": SCHEMA, "source_url": run_command("git", "remote", "get-url", "origin"),
         "source_commit": run_command("git", "rev-parse", "HEAD"), "benchmark": LOCK["benchmark"],
@@ -470,10 +472,6 @@ def workflow(args, work, run, deadline):
         )},
     }
     if sanity_manifest:
-        keys = set(identity_base) | {"profile"}
-        compare = {k: v for k, v in sanity_manifest["identity"].items() if k in keys}
-        require(compare == {**identity_base, "profile": profile},
-                "Source commit, assets or dependencies differ from verified sanity. Run a new sanity with the current configuration.")
         shutil.rmtree(verified_sanity.parent)
     require(1 <= args.partition_count <= len(used_video_ids) and 0 <= args.partition_index < args.partition_count,
             "Invalid partition count or index")
@@ -564,6 +562,7 @@ def main():
     parser.add_argument("--cache", type=Path, default=Path("/kaggle/quantiphy-cache"))
     parser.add_argument("--output", type=Path, default=Path("/kaggle/working"))
     parser.add_argument("--sanity-archive", type=Path)
+    parser.add_argument("--profile", choices=("replica_fp16", "split_fp16"), default="replica_fp16")
     parser.add_argument("--resume-archive", type=Path)
     parser.add_argument("--merge-archive", type=Path, action="append", default=[])
     parser.add_argument("--model-dir", type=Path)

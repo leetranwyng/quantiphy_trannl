@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import re
@@ -426,6 +427,8 @@ def run_sample(root, spec, options, model, tokenizer, processor, template, video
         cache_key = (spec["video"]["path"], spec["video"]["sha256"], spec["record"]["fps"])
         cache_hit = cache_key in video_cache
         if not cache_hit:
+            gc.collect()
+            torch.cuda.empty_cache()
             record = {**spec["record"], "video": str(run / spec["video"]["path"])}
             video_cache[cache_key] = observed_video(run, record)
         video_cache.move_to_end(cache_key)
@@ -529,9 +532,16 @@ def run_worker(options):
             tag = "smoke_on" if options["phase"] == "smoke" else "evaluation"
             result = run_sample(root, spec, options, model, tokenizer, processor, template, cache, run, True, tag)
             report["results"].append(result)
+            if options["phase"] == "evaluation" and result["status"] == "error":
+                cache.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
+                result = run_sample(root, spec, options, model, tokenizer, processor, template, cache, run, True, tag)
+                report["results"].append(result)
             print(f"{options['worker']} {spec['id']} {result['status']} {result['wall_seconds']:.1f}s", flush=True)
             write_json(worker_output / "worker.json", report)
             if result.get("oom"):
+                gc.collect()
                 torch.cuda.empty_cache()
                 if options["phase"] == "smoke":
                     break

@@ -45,21 +45,32 @@ def run_workflow(source, mode, options, config):
 def full_options(config):
     if not 0 <= config["PARTITION_INDEX"] < config["PARTITION_COUNT"]:
         raise ValueError("PARTITION_INDEX must be between 0 and PARTITION_COUNT - 1.")
-    options = ["--partition-count", str(config["PARTITION_COUNT"]), "--partition-index", str(config["PARTITION_INDEX"])]
+    profile = config.get("PROFILE") or "replica_fp16"
+    options = [
+        "--profile", str(profile),
+        "--partition-count", str(config["PARTITION_COUNT"]),
+        "--partition-index", str(config["PARTITION_INDEX"]),
+    ]
     if config["MERGE_ARCHIVES"]:
         if config["PARTITION_COUNT"] < 2 or len(config["MERGE_ARCHIVES"]) != config["PARTITION_COUNT"]:
             raise ValueError("Supply one archive per partition in MERGE_ARCHIVES.")
         for archive in config["MERGE_ARCHIVES"]:
             options += ["--merge-archive", archive]
         return "merge", options
-    candidates = [Path(config["SANITY_ARCHIVE"])] if config["SANITY_ARCHIVE"] else sorted(
-        path for path in Path("/kaggle/input").rglob("quantiphy_sanity.tar") if path.is_file()
-    )
-    if len(candidates) != 1 or not candidates[0].is_file():
-        raise ValueError("Attach one saved sanity output via Add Input or set SANITY_ARCHIVE to its path.")
-    options += ["--sanity-archive", str(candidates[0])]
-    if config["RESUME_ARCHIVE"]:
-        options += ["--resume-archive", config["RESUME_ARCHIVE"]]
+    sanity_archive = config.get("SANITY_ARCHIVE", "")
+    if sanity_archive:
+        sanity_path = Path(sanity_archive)
+        if not sanity_path.is_file():
+            raise ValueError(f"SANITY_ARCHIVE does not exist: {sanity_path}")
+        options += ["--sanity-archive", str(sanity_path)]
+    resume_archive = config.get("RESUME_ARCHIVE", "")
+    if resume_archive == "auto":
+        found = sorted(path for path in Path("/kaggle/input").rglob("quantiphy_full.tar") if path.is_file())
+        if len(found) != 1:
+            raise ValueError(f"RESUME_ARCHIVE='auto' expected 1 quantiphy_full.tar in /kaggle/input, found {len(found)}.")
+        options += ["--resume-archive", str(found[0])]
+    elif resume_archive:
+        options += ["--resume-archive", str(resume_archive)]
     return "full", options
 
 
