@@ -90,10 +90,19 @@ def show_result(SUMMARY):
             "samples/*/attempt-*/exception.txt",
         ):
             for extra in sorted(run.glob(pattern)):
+                if extra.name in {"worker.json", "worker.log"}:
+                    receipt = extra.with_name("worker.json")
+                    info = json.loads(receipt.read_text(encoding="utf-8")) if receipt.is_file() else {}
+                    failed = (
+                        bool(info.get("worker_error"))
+                        or info.get("returncode", 0) != 0
+                        or not info.get("model_loaded", False)
+                        or any(r.get("status") == "error" for r in info.get("results", []))
+                    )
+                    if not failed:
+                        continue
                 rel = extra.relative_to(run).as_posix()
                 text = extra.read_text(encoding="utf-8", errors="replace")
-                if extra.name == "worker.json" and '"worker_error"' not in text:
-                    continue
                 print(f"\n{rel}\n{text[-4000:]}")
 
     predictions = run / "predictions.csv"

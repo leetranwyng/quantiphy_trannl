@@ -321,6 +321,22 @@ def _build_prompt_ids(
     return tokenizer.encode(rendered, add_special_tokens=False)[:MAX_PROMPT_LENGTH]
 
 
+def _find_nframes_interval_error(exc: BaseException) -> re.Match[str] | None:
+    seen: set[int] = set()
+    queue: list[BaseException | None] = [exc]
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ValueError):
+            match = NFRAMES_INTERVAL_PATTERN.search(str(current))
+            if match is not None:
+                return match
+        queue.extend((current.__cause__, current.__context__))
+    return None
+
+
 def _process_video(video: str, on_request=None) -> tuple[Any, float]:
     from qwen_vl_utils.vision_process import fetch_video
 
@@ -341,8 +357,8 @@ def _process_video(video: str, on_request=None) -> tuple[Any, float]:
             return_video_sample_fps=True,
             return_video_metadata=True,
         )
-    except ValueError as exc:
-        match = NFRAMES_INTERVAL_PATTERN.search(str(exc))
+    except Exception as exc:
+        match = _find_nframes_interval_error(exc)
         if match is None:
             raise
         min_allowed, max_allowed, requested = (int(value) for value in match.groups())
