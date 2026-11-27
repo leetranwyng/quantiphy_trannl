@@ -326,10 +326,29 @@ def _run_gpu_vlm_subprocess(
     with log_path.open("wb") as lf:
         proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=lf, stderr=subprocess.STDOUT)
     rcs = _stream_subprocesses([(proc, log_path, f"vlm-{tag_suffix}")])
-    if rcs[0] != 0 or not receipt_path.is_file():
-        tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:] if log_path.is_file() else ""
-        raise RuntimeError(f"Stage 1 VLM worker failed (rc={rcs[0]}). Log ({log_path}):\n{tail}")
-    return read_json(receipt_path)
+    if receipt_path.is_file():
+        r_json = read_json(receipt_path)
+        if rcs[0] != 0 and r_json.get("status") == "ok":
+            r_json["status"] = "error"
+            r_json.setdefault("errors", []).append({
+                "worker": f"vlm-{tag_suffix}",
+                "stage": "vlm_stage",
+                "error": f"Stage 1 VLM worker exited with non-zero code rc={rcs[0]}",
+            })
+        return r_json
+    tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:] if log_path.is_file() else ""
+    return {
+        "status": "error",
+        "stage": "vlm_stage",
+        "llm_parse_outputs": {},
+        "vlm_ground_by_video": {},
+        "errors": [{
+            "worker": f"vlm-{tag_suffix}",
+            "stage": "vlm_stage",
+            "error": f"Stage 1 VLM worker exited without receipt (rc={rcs[0]})",
+            "log_tail": tail,
+        }],
+    }
 
 
 def _run_gpu_track_subprocesses(
@@ -514,7 +533,85 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
     scope = args.scope or ("sanity4" if mode == "sanity" else "target18")
     dtype_profile = args.dtype_profile
     run_id = args.run_id or f"iiixr-{mode}-{int(time.time())}"
+    run_dir = args.run_dir or (args.output / "outputs" / "iiixr" / run_id / "run")
+    args.output.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        return _execute_workflow_inner(
+            args=args,
+            t_start=t_start,
+            mode=mode,
+            scope=scope,
+            dtype_profile=dtype_profile,
+            run_id=run_id,
+            run_dir=run_dir,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        (run_dir / "workflow_exception.txt").write_text(tb, encoding="utf-8")
+        print(f"[WORKFLOW FATAL ERROR] mode={mode} run_dir={run_dir}\n{tb}", file=sys.stderr, flush=True)
+        archives: list[dict[str, Any]] = []
+        if not args.no_tar and run_dir.is_dir():
+            try:
+                _seal_manifest(
+                    run_dir,
+                    {
+                        "run_id": run_id,
+                        "mode": mode,
+                        "scope": scope,
+                        "status": "ERROR",
+                        "created_at": utc_now_iso(),
+                    },
+                )
+                archives = _package_tar_archives(
+                    run_dir=run_dir,
+                    output_dir=args.output,
+                    base_archive_name=f"iiixr_box_{mode}.tar",
+                    budget_bytes=int(args.output_budget_gib * GIB),
+                )
+            except Exception:
+                pass
+        err_summary = {
+            "run_id": run_id,
+            "mode": mode,
+            "scope": scope,
+            "status": "ERROR",
+            "run_dir": str(run_dir),
+            "viewer_html": str(run_dir / "index.html"),
+            "per_question_csv": str(run_dir / "per_question.csv"),
+            "source_commit": _git_head_sha(REPO_ROOT),
+            "upstream_commit": None,
+            "dtype_profile": dtype_profile,
+            "wall_seconds": round(time.perf_counter() - t_start, 3),
+            "archives": archives,
+            "sanity_parity_report": None,
+            "evaluation": {},
+            "verification": {"verified": False},
+            "stage_errors": [
+                {
+                    "stage": "workflow",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": tb,
+                    "run_dir": str(run_dir),
+                }
+            ],
+        }
+        write_json_atomic(args.output / "iiixr_summary.json", err_summary)
+        write_json_atomic(run_dir / "summary.json", err_summary)
+        return err_summary
+
+
+def _execute_workflow_inner(
+    *,
+    args: argparse.Namespace,
+    t_start: float,
+    mode: str,
+    scope: str,
+    dtype_profile: str,
+    run_id: str,
+    run_dir: Path,
+) -> dict[str, Any]:
     upstream_info = ensure_upstream_tree(UPSTREAM_DIR, auto_clone=args.auto_clone_upstream)
     owl_info = extract_owl_threshold(UPSTREAM_DIR)
     iiixr_fps_map = extract_iiixr_file_fps_val(UPSTREAM_DIR)
@@ -524,7 +621,6 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
     need_gpu = mode in ("sanity", "full")
     devices = _query_gpu_devices(require_two_t4=(need_gpu and not args.allow_any_gpu))
 
-    run_dir = args.run_dir or (args.output / "outputs" / "iiixr" / run_id / "run")
     work_dir = args.cache / "work" / run_id
     track_cache_dir = args.cache / "track_cache"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -659,12 +755,14 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
         with FreshAntiCacheGuard(enabled=True):
             # Initial rule parse so Stage 1 VLM knows query phrases for vlm_ground --notext
             prelim_parsed = parse_questions_v1_v2(all_context_rows, llm_outputs_by_id={})
+            abort_gpu_pipeline = False
 
             # Sanity Check: Trace OFF vs Trace ON parity on #399 (simulation_0163)
             if mode == "sanity" and not args.skip_parity_check and "simulation_0163" in selected_videos:
                 v_0163_v1 = [prelim_parsed["v1_records"][r["id"]] for r in inputs["video_context_rows"]["simulation_0163"]]
                 v_0163_v2 = [prelim_parsed["v2_records"][r["id"]] for r in inputs["video_context_rows"]["simulation_0163"]]
                 parity_vals = []
+                parity_errors: list[dict[str, Any]] = []
                 for tr_flag, sfx in ((False, "trace_off"), (True, "trace_on")):
                     sub_dir = run_dir / "preflight_parity" / sfx
                     sub_dir.mkdir(parents=True, exist_ok=True)
@@ -691,6 +789,15 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                         seed=0,
                         tag_suffix=sfx,
                     )
+                    if p_res["errors"] or "simulation_0163" not in p_res["video_results"]:
+                        errs_here = [
+                            {"phase": f"preflight_parity_{sfx}", **e}
+                            for e in (p_res["errors"] or [{"stage": "preflight_parity", "video_id": "simulation_0163", "error": "Missing simulation_0163 result"}])
+                        ]
+                        parity_errors.extend(errs_here)
+                        stage_errors.extend(errs_here)
+                        abort_gpu_pipeline = True
+                        break
                     vb = p_res["video_results"]["simulation_0163"]
                     active_tj = vb["track_v2"] if vb.get("track_v2") is not None else vb["track_v1"]
                     m_out = measure_video_instrumented(
@@ -701,43 +808,61 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                         target_question_ids={399},
                     )
                     parity_vals.append(float(m_out["results_by_id"][399]["geo_value"]))
-                parity_ok = len(parity_vals) == 2 and math.isclose(parity_vals[0], parity_vals[1], rel_tol=0.0, abs_tol=1e-12)
-                sanity_parity_report = {
-                    "sample_id": 399,
-                    "video_id": "simulation_0163",
-                    "trace_off_value": parity_vals[0],
-                    "trace_on_value": parity_vals[1],
-                    "identical_trace_off_on": parity_ok,
-                }
+
+                if parity_errors:
+                    sanity_parity_report = {
+                        "sample_id": 399,
+                        "video_id": "simulation_0163",
+                        "status": "error",
+                        "trace_off_value": parity_vals[0] if len(parity_vals) >= 1 else None,
+                        "trace_on_value": parity_vals[1] if len(parity_vals) >= 2 else None,
+                        "identical_trace_off_on": False,
+                        "errors": parity_errors,
+                    }
+                else:
+                    parity_ok = len(parity_vals) == 2 and math.isclose(parity_vals[0], parity_vals[1], rel_tol=0.0, abs_tol=1e-12)
+                    sanity_parity_report = {
+                        "sample_id": 399,
+                        "video_id": "simulation_0163",
+                        "status": "ok" if parity_ok else "mismatch",
+                        "trace_off_value": parity_vals[0],
+                        "trace_on_value": parity_vals[1],
+                        "identical_trace_off_on": parity_ok,
+                    }
                 write_json_atomic(run_dir / "configs" / "trace_parity_check.json", sanity_parity_report)
 
             # Stage 1: Qwen3-VL-8B-Instruct sharded across both T4s (optional LLM parse + vlm_ground_notext)
-            vg_videos_payload = [
-                {
-                    "video_id": vid,
-                    "video_path": str(assets["video_paths"][vid]),
-                    "parse_v2_records": [prelim_parsed["v2_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
-                }
-                for vid in selected_videos
-            ]
-            vlm_receipt = _run_gpu_vlm_subprocess(
-                run_dir=run_dir,
-                work_dir=work_dir,
-                run_id=run_id,
-                qwen_dir=assets["model_dirs"]["qwen3_vl_8b"],
-                qwen_rev=assets["model_revs"]["qwen3_vl_8b"],
-                dtype_profile=dtype_profile,
-                parse_rows=all_context_rows,
-                vlm_ground_videos=vg_videos_payload,
-                devices=devices,
-                run_llm_parse=not args.rule_parse_only,
-                trace_enabled=True,
-                seed=0,
-                tag_suffix="stage1",
-            )
-            for k_id, v_llm in (vlm_receipt.get("llm_parse_outputs") or {}).items():
-                llm_parse_map[int(k_id)] = v_llm
-            vlm_ground_by_video = vlm_receipt.get("vlm_ground_by_video") or {}
+            if not abort_gpu_pipeline:
+                vg_videos_payload = [
+                    {
+                        "video_id": vid,
+                        "video_path": str(assets["video_paths"][vid]),
+                        "parse_v2_records": [prelim_parsed["v2_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
+                    }
+                    for vid in selected_videos
+                ]
+                vlm_receipt = _run_gpu_vlm_subprocess(
+                    run_dir=run_dir,
+                    work_dir=work_dir,
+                    run_id=run_id,
+                    qwen_dir=assets["model_dirs"]["qwen3_vl_8b"],
+                    qwen_rev=assets["model_revs"]["qwen3_vl_8b"],
+                    dtype_profile=dtype_profile,
+                    parse_rows=all_context_rows,
+                    vlm_ground_videos=vg_videos_payload,
+                    devices=devices,
+                    run_llm_parse=not args.rule_parse_only,
+                    trace_enabled=True,
+                    seed=0,
+                    tag_suffix="stage1",
+                )
+                if vlm_receipt.get("status") != "ok" or vlm_receipt.get("errors"):
+                    stage_errors.extend(vlm_receipt.get("errors") or [{"stage": "vlm_stage", "error": "Stage 1 VLM failed"}])
+                    abort_gpu_pipeline = True
+                else:
+                    for k_id, v_llm in (vlm_receipt.get("llm_parse_outputs") or {}).items():
+                        llm_parse_map[int(k_id)] = v_llm
+                    vlm_ground_by_video = vlm_receipt.get("vlm_ground_by_video") or {}
 
             # Re-run deterministic v1/v2 parser incorporating LLM fallback outputs (if any)
             parsed_bundle = parse_questions_v1_v2(all_context_rows, llm_outputs_by_id=llm_parse_map)
@@ -756,35 +881,36 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     )
 
             # Stage 2: 2 parallel single-GPU workers sharded across selected_videos
-            video_items_payload = [
-                {
-                    "video_id": vid,
-                    "video_path": str(assets["video_paths"][vid]),
-                    "fps": csv_fps_by_vid[vid],
-                    "parse_v1_records": [parsed_bundle["v1_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
-                    "parse_v2_records": [parsed_bundle["v2_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
-                    "vlm_ground_records": vlm_ground_by_video.get(vid, []),
-                    "attempt": 1,
-                }
-                for vid in selected_videos
-            ]
-            track_stage_out = _run_gpu_track_subprocesses(
-                run_dir=run_dir,
-                work_dir=work_dir,
-                run_id=run_id,
-                video_items=video_items_payload,
-                model_dirs=assets["model_dirs"],
-                model_revs=assets["model_revs"],
-                dtype_profile=dtype_profile,
-                devices=devices,
-                track_cache_dir=track_cache_dir,
-                use_video_cache=not args.no_cache,
-                trace_enabled=True,
-                seed=0,
-                tag_suffix="stage2",
-            )
-            video_track_bundles = track_stage_out["video_results"]
-            stage_errors.extend(track_stage_out["errors"])
+            if not abort_gpu_pipeline:
+                video_items_payload = [
+                    {
+                        "video_id": vid,
+                        "video_path": str(assets["video_paths"][vid]),
+                        "fps": csv_fps_by_vid[vid],
+                        "parse_v1_records": [parsed_bundle["v1_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
+                        "parse_v2_records": [parsed_bundle["v2_records"][r["id"]] for r in inputs["video_context_rows"][vid]],
+                        "vlm_ground_records": vlm_ground_by_video.get(vid, []),
+                        "attempt": 1,
+                    }
+                    for vid in selected_videos
+                ]
+                track_stage_out = _run_gpu_track_subprocesses(
+                    run_dir=run_dir,
+                    work_dir=work_dir,
+                    run_id=run_id,
+                    video_items=video_items_payload,
+                    model_dirs=assets["model_dirs"],
+                    model_revs=assets["model_revs"],
+                    dtype_profile=dtype_profile,
+                    devices=devices,
+                    track_cache_dir=track_cache_dir,
+                    use_video_cache=not args.no_cache,
+                    trace_enabled=True,
+                    seed=0,
+                    tag_suffix="stage2",
+                )
+                video_track_bundles = track_stage_out["video_results"]
+                stage_errors.extend(track_stage_out["errors"])
 
             # Stage 3: CPU Geometric & Kinematic Measurement (both v2 and v3nt branches + xground fusion)
             meas_by_vid: dict[str, dict[str, Any]] = {}
@@ -840,6 +966,10 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     continue
 
                 if vid not in meas_by_vid:
+                    vid_err = next(
+                        (e for e in stage_errors if e.get("video_id") in (vid, None)),
+                        stage_errors[0] if stage_errors else {},
+                    )
                     predictions_out.append({
                         "id": qid,
                         "video_id": vid,
@@ -849,8 +979,8 @@ def execute_workflow(args: argparse.Namespace) -> dict[str, Any]:
                         "in_scope_2d_motion": True,
                         "support_reason": row["support_reason"],
                         "status": "error",
-                        "error_stage": "track_worker",
-                        "why": "Video track stage failed; see stderr.txt in videos_trace/",
+                        "error_stage": str(vid_err.get("stage") or vid_err.get("phase") or "track_worker"),
+                        "why": str(vid_err.get("error") or "Video track stage failed; see stderr.txt in videos_trace/"),
                         "fresh_box": None,
                         "fresh_box_v2": None,
                         "fresh_box_v3nt": None,

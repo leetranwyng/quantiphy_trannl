@@ -433,6 +433,262 @@ class TestIIIXRBoxPipeline(unittest.TestCase):
         self.assertIn("DERIVED PLOT", html_txt)
         self.assertAlmostEqual(compute_row_mra(0.3420306158490744, 0.339), 1.0, places=6)
 
+    def test_07_safe_track_modules_and_track_worker_orchestration(self) -> None:
+        from unittest.mock import patch
+        from solutions.iiixr.kaggle import gpu_stages
+
+        # Force fresh AST compilation of upstream track & track_v2 pure helpers
+        sys.modules.pop("track", None)
+        sys.modules.pop("track_v2", None)
+        gpu_stages._install_safe_track_modules(UPSTREAM_DIR)
+
+        import track as trk_v1_mod
+        import track_v2 as trk_v2_mod
+
+        self.assertNotIn("torch", trk_v1_mod.__dict__)
+        self.assertNotIn("gdino", trk_v1_mod.__dict__)
+        self.assertNotIn("sam2_track", trk_v1_mod.__dict__)
+        self.assertNotIn("gdino", trk_v2_mod.__dict__)
+
+        self.assertIsNotNone(self.val_csv)
+        self.assertIsNotNone(self.vid_dir)
+        inputs = load_validation_inference_inputs(self.val_csv, scope="sanity4")
+        rows_0163 = inputs["video_context_rows"]["simulation_0163"]
+        parsed = parse_questions_v1_v2(rows_0163)
+        v1_recs = [parsed["v1_records"][r["id"]] for r in rows_0163]
+        v2_recs = [parsed["v2_records"][r["id"]] for r in rows_0163]
+
+        qs_v1 = trk_v1_mod.queries_for(v1_recs)
+        qs_v2 = trk_v2_mod.queries_for(v2_recs)
+        self.assertGreaterEqual(len(qs_v1), 1)
+        self.assertGreaterEqual(len(qs_v2), 1)
+
+        def fake_gdino(frames, det_indices, phrases, model_dir, thr, amp_dtype, device="cuda"):
+            dets = {
+                ph: [[([100.0 + k * 4.0, 200.0, 140.0 + k * 4.0, 240.0], 0.24)] for k in range(len(det_indices))]
+                for ph in phrases
+            }
+            return dets, {"threshold": thr, "candidates_by_phrase": {}}
+
+        def fake_owlv2(frames, det_indices, phrases, model_dir, amp_dtype, thr=0.05, topk=25, device="cuda"):
+            out = [
+                {ph: [([100.0 + k * 4.0, 200.0, 140.0 + k * 4.0, 240.0], 0.42)] for ph in phrases}
+                for k in range(len(det_indices))
+            ]
+            return out, {"threshold": thr, "per_frame_candidates": []}
+
+        def fake_sam2(frames, anchors, model_dir, dtype_profile, keep_all_polys=True, device="cuda"):
+            res = {}
+            for oid, _fi, _box in anchors:
+                per_f = {}
+                for j in range(len(frames)):
+                    cx = 120.0 + 3.5 * j + 0.04 * j * j
+                    cy = 220.0
+                    st = {
+                        "area": 1296,
+                        "box": [int(cx - 18), int(cy - 18), int(cx + 18), int(cy + 18)],
+                        "c": [float(cx), float(cy)],
+                        "rr": [36.0, 36.0, 0.0],
+                        "pca": [36.0, 36.0],
+                        "border": 0,
+                        "bottom": float(cy + 18),
+                        "top": float(cy - 18),
+                    }
+                    poly = [[[int(cx - 18), int(cy - 18)], [int(cx + 18), int(cy - 18)], [int(cx + 18), int(cy + 18)], [int(cx - 18), int(cy + 18)]]]
+                    per_f[j] = (st, 7.5, poly, {"white": 0.8})
+                res[int(oid)] = per_f
+            return res, {"sam2_dtype": "mock_fp16"}
+
+        vg_mock = [
+            {
+                "video_id": "simulation_0163",
+                "key": qs_v2[0]["key"],
+                "phrase": qs_v2[0]["phrase"],
+                "where": qs_v2[0]["where"],
+                "roles": qs_v2[0]["roles"],
+                "expr": qs_v2[0]["phrase"],
+                "multi": False,
+                "j": 0,
+                "boxes_rel1000": [[102.0, 202.0, 138.0, 238.0]],
+            }
+        ]
+        work_root = self.tmp_dir / "mock_worker"
+        work_root.mkdir(parents=True, exist_ok=True)
+        work_json = work_root / "work.json"
+        receipt_json = work_root / "receipt.json"
+        write_json_atomic(
+            work_json,
+            {
+                "run_dir": str(work_root / "run"),
+                "run_id": "mock-track-worker",
+                "worker_name": "track-worker-0-mock",
+                "dtype_profile": "t4_fp16",
+                "seed": 0,
+                "trace_enabled": True,
+                "use_video_cache": False,
+                "track_cache_dir": str(work_root / "cache"),
+                "models": {"grounding_dino": "mock_gd", "owlv2": "mock_owl", "sam2": "mock_sam"},
+                "model_revisions": {"grounding_dino": "r1", "owlv2": "r2", "sam2": "r3"},
+                "videos": [
+                    {
+                        "video_id": "simulation_0163",
+                        "video_path": str(self.vid_dir / "simulation_0163.mp4"),
+                        "fps": 24.0,
+                        "parse_v1_records": v1_recs,
+                        "parse_v2_records": v2_recs,
+                        "vlm_ground_records": vg_mock,
+                        "attempt": 1,
+                    }
+                ],
+                "receipt_path": str(receipt_json),
+            },
+        )
+        with (
+            patch.object(gpu_stages, "_run_gdino_instrumented", side_effect=fake_gdino),
+            patch.object(gpu_stages, "_run_owlv2_instrumented", side_effect=fake_owlv2),
+            patch.object(gpu_stages, "_run_sam2_instrumented", side_effect=fake_sam2),
+        ):
+            receipt = gpu_stages.run_track_stage_worker(work_json)
+
+        self.assertEqual(receipt["status"], "ok")
+        self.assertEqual(receipt["errors"], [])
+        self.assertIn("simulation_0163", receipt["video_results"])
+        vb = receipt["video_results"]["simulation_0163"]
+        self.assertIsNotNone(vb["track_v1"])
+        self.assertIsNotNone(vb["track_v2"])  # best_score=0.24 < 0.3 triggers A2_det -> track_v2 runs!
+        self.assertIsNotNone(vb["track_v3nt"])
+        self.assertGreaterEqual(len(vb["overlay_refs"]), 1)
+
+    def test_08_sanity_workflow_graceful_error_summary_on_worker_failure(self) -> None:
+        from unittest.mock import patch
+        from solutions.iiixr.kaggle import workflow
+
+        self.assertIsNotNone(self.val_csv)
+        self.assertIsNotNone(self.vid_dir)
+        # Stage a mini dataset dir with validation_dataset.csv + 3 sanity videos
+        ds_dir = self.tmp_dir / "mock_ds"
+        ds_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.val_csv, ds_dir / "validation_dataset.csv")
+        for vid in ("simulation_0163", "simulation_0089", "internet_0019"):
+            shutil.copy2(self.vid_dir / f"{vid}.mp4", ds_dir / f"{vid}.mp4")
+        models_dir = self.tmp_dir / "mock_models"
+        for sub in ("grounding-dino-base", "owlv2-base-patch16-ensemble", "sam2.1-hiera-large", "Qwen3-VL-8B-Instruct"):
+            (models_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        out_dir = self.tmp_dir / "sanity_err_out"
+        parser = workflow.build_arg_parser()
+        args = parser.parse_args([
+            "sanity",
+            "--allow-any-gpu",
+            "--dataset-dir",
+            str(ds_dir),
+            "--models-dir",
+            str(models_dir),
+            "--caw-tar",
+            str(self.caw_tar),
+            "--cache",
+            str(self.tmp_dir / "sanity_err_cache"),
+            "--output",
+            str(out_dir),
+            "--run-id",
+            "sanity-err-check",
+            "--no-tar",
+        ])
+
+        def failing_track_subproc(**_kwargs):
+            return {
+                "video_results": {},
+                "errors": [{"worker": "track-worker-0-trace_off", "stage": "track_worker", "video_id": "simulation_0163", "error": "Simulated worker crash"}],
+            }
+
+        with patch.object(workflow, "_run_gpu_track_subprocesses", side_effect=failing_track_subproc):
+            summary = workflow.execute_workflow(args)
+
+        self.assertEqual(summary["status"], "ERROR")
+        self.assertTrue((out_dir / "iiixr_summary.json").is_file())
+        self.assertGreaterEqual(len(summary["stage_errors"]), 1)
+        self.assertIn("Simulated worker crash", summary["stage_errors"][0]["error"])
+        self.assertTrue(summary["verification"]["verified"])
+
+    def test_09_sanity_workflow_mocked_happy_path_full_trace(self) -> None:
+        from unittest.mock import patch
+        from solutions.iiixr.kaggle import workflow
+
+        self.assertIsNotNone(self.val_csv)
+        self.assertIsNotNone(self.vid_dir)
+        ds_dir = self.tmp_dir / "mock_ds_ok"
+        ds_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.val_csv, ds_dir / "validation_dataset.csv")
+        for vid in ("simulation_0163", "simulation_0089", "internet_0019"):
+            shutil.copy2(self.vid_dir / f"{vid}.mp4", ds_dir / f"{vid}.mp4")
+        models_dir = self.tmp_dir / "mock_models_ok"
+        for sub in ("grounding-dino-base", "owlv2-base-patch16-ensemble", "sam2.1-hiera-large", "Qwen3-VL-8B-Instruct"):
+            (models_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        out_dir = self.tmp_dir / "sanity_ok_out"
+        parser = workflow.build_arg_parser()
+        args = parser.parse_args([
+            "sanity",
+            "--allow-any-gpu",
+            "--dataset-dir",
+            str(ds_dir),
+            "--models-dir",
+            str(models_dir),
+            "--caw-tar",
+            str(self.caw_tar),
+            "--cache",
+            str(self.tmp_dir / "sanity_ok_cache"),
+            "--output",
+            str(out_dir),
+            "--run-id",
+            "sanity-ok-check",
+            "--no-tar",
+        ])
+
+        def fake_vlm_subproc(**_kwargs):
+            return {"status": "ok", "stage": "vlm_stage", "llm_parse_outputs": {}, "vlm_ground_by_video": {}, "errors": []}
+
+        def fake_track_subproc(**kwargs):
+            vid_res = {}
+            for item in kwargs["video_items"]:
+                vid = item["video_id"]
+                fps = float(item["fps"])
+                fidx = list(range(48))
+                q_specs = []
+                seen_k = set()
+                for r in item["parse_v2_records"]:
+                    for role_name, ent in (("target", r["target"]), ("prior", r["prior_obj"])):
+                        if ent and ent.get("phrase"):
+                            k = ent["phrase"] + "|" + ",".join(ent.get("where") or [])
+                            if k not in seen_k:
+                                seen_k.add(k)
+                                fr = _make_synthetic_track_frames(
+                                    fidx, fps, lambda t: (100.0 + 80.0 * t, 60.0 + 140.0 * t * t), box_w=36.0, box_h=36.0
+                                )
+                                q_specs.append((k, ent["phrase"], list(ent.get("where") or []), [role_name], fr))
+                vj = _make_synthetic_vj(vid, fidx, fps, 854, 480, q_specs)
+                vid_res[vid] = {
+                    "video_id": vid,
+                    "track_v1": vj,
+                    "track_v2": vj,
+                    "track_v3nt": vj,
+                    "scene_ruler": None,
+                    "overlay_refs": {},
+                }
+            return {"video_results": vid_res, "errors": []}
+
+        with (
+            patch.object(workflow, "_run_gpu_vlm_subprocess", side_effect=fake_vlm_subproc),
+            patch.object(workflow, "_run_gpu_track_subprocesses", side_effect=fake_track_subproc),
+        ):
+            summary = workflow.execute_workflow(args)
+
+        self.assertEqual(summary["status"], "PASS")
+        self.assertTrue(summary["sanity_parity_report"]["identical_trace_off_on"])
+        self.assertTrue(summary["verification"]["verified"])
+        self.assertEqual(summary["evaluation"]["fresh_coverage"]["generated_ok"], 4)
+        self.assertGreaterEqual(summary["verification"]["cpu_recomputed_branch_traces"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

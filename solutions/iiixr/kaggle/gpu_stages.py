@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gc
 import json
 import math
@@ -11,6 +12,7 @@ import re
 import sys
 import time
 import traceback
+import types
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +145,13 @@ def render_track_overlay_rgb(
     return canvas
 
 
+def _bind_tensors_to_device(batch: Any, device: Any) -> dict[str, Any]:
+    return {
+        k: (v.to(device) if hasattr(v, "to") else v)
+        for k, v in dict(batch).items()
+    }
+
+
 # =============================================================================
 # Stage 1 Worker: Qwen3-VL-8B-Instruct (Sharded across 2xT4 in FP16, batch 1)
 # =============================================================================
@@ -155,246 +164,307 @@ def run_vlm_stage_worker(work_json_path: Path) -> dict[str, Any]:
     store = TraceStore(run_dir, run_id, enabled=trace_enabled)
     set_deterministic_seeds(int(spec.get("seed", 0)))
 
-    with FreshAntiCacheGuard(enabled=True):
-        import torch
-        from PIL import Image
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    model = None
+    proc = None
+    try:
+        with FreshAntiCacheGuard(enabled=True):
+            import torch
+            from PIL import Image
+            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-        mods = _load_upstream_geo_modules(UPSTREAM_DIR)
-        parse_v1 = mods["parse_v1"]
-        rules_v1 = mods["rules_v1"]
-        tc = mods["tc"]
+            mods = _load_upstream_geo_modules(UPSTREAM_DIR)
+            parse_v1 = mods["parse_v1"]
+            rules_v1 = mods["rules_v1"]
+            tc = mods["tc"]
 
-        model_dir = Path(spec["qwen_model_dir"])
-        model_rev = spec["qwen_revision"]
-        dtype_profile = spec.get("dtype_profile", "t4_fp16")
-        torch_dtype = torch.bfloat16 if dtype_profile == "upstream_bf16" else torch.float16
+            model_dir = Path(spec["qwen_model_dir"])
+            model_rev = spec["qwen_revision"]
+            dtype_profile = spec.get("dtype_profile", "t4_fp16")
+            torch_dtype = (
+                torch.bfloat16
+                if dtype_profile == "upstream_bf16"
+                else (torch.float32 if dtype_profile == "fp32" else torch.float16)
+            )
 
-        _reset_vram_peaks()
-        t_load0 = time.perf_counter()
-        proc = AutoProcessor.from_pretrained(str(model_dir))
-        device_map = "balanced" if torch.cuda.device_count() >= 2 else {"": 0}
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            str(model_dir),
-            dtype=torch_dtype,
-            device_map=device_map,
-            attn_implementation="sdpa",
-            low_cpu_mem_usage=True,
-        ).eval()
-        torch.cuda.synchronize()
-        load_sec = time.perf_counter() - t_load0
-        load_vram = _vram_snapshot()
-
-        first_dev = next(model.parameters()).device
-
-        # 1. Optional LLM fallback parse (geo/parse.py lines 32-72)
-        llm_parse_outputs: dict[str, Any] = {}
-        if spec.get("run_llm_parse", False):
-            for row in spec.get("parse_rows", []):
-                assert "ground_truth_posterior" not in row
-                rid = int(row["id"])
-                dep = rules_v1.parse_depth(row.get("depth_info", "")) if str(row["video_type"])[1] == "3" else []
-                dkeys = sorted({d["key"] for d in dep})
-                user_prompt = parse_v1.build_prompt(
-                    rules_v1.clean_text(row["question"]),
-                    rules_v1.clean_text(row["ground_truth_prior"]).replace("\n", "; "),
-                    dkeys,
-                )
-                messages = [
-                    {"role": "system", "content": "You are a precise information extraction assistant."},
-                    {"role": "user", "content": user_prompt},
-                ]
-                rendered = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                _reset_vram_peaks()
-                t0 = time.perf_counter()
-                inp = proc(text=[rendered], return_tensors="pt").to(first_dev)
-                with torch.inference_mode():
-                    gen_ids = model.generate(**inp, max_new_tokens=200, do_sample=False)
-                torch.cuda.synchronize()
-                dur = time.perf_counter() - t0
-                prompt_ids = inp["input_ids"][0].detach().cpu().tolist()
-                out_ids = gen_ids[0, inp["input_ids"].shape[1]:].detach().cpu().tolist()
-                raw_txt = proc.decode(out_ids, skip_special_tokens=True).strip()
-                parsed_json = parse_v1.parse_json(raw_txt)
-                rec_out = {
-                    "id": rid,
-                    "model_repo": "Qwen/Qwen3-VL-8B-Instruct",
-                    "revision": model_rev,
-                    "dtype": str(torch_dtype),
-                    "messages": messages,
-                    "rendered_prompt": rendered,
-                    "prompt_token_ids": prompt_ids,
-                    "output_token_ids": out_ids,
-                    "raw_response": raw_txt,
-                    "parsed": parsed_json,
-                    "duration_sec": round(dur, 4),
-                    "vram": _vram_snapshot(),
+            _reset_vram_peaks()
+            t_load0 = time.perf_counter()
+            proc = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            load_kwargs: dict[str, Any] = {
+                "dtype": torch_dtype,
+                "attn_implementation": "sdpa",
+                "low_cpu_mem_usage": True,
+                "local_files_only": True,
+            }
+            if n_gpus >= 2:
+                load_kwargs["device_map"] = "balanced"
+                load_kwargs["max_memory"] = {
+                    i: min(13 * 1024**3, max(4 * 1024**3, torch.cuda.mem_get_info(i)[0] - 2 * 1024**3))
+                    for i in range(n_gpus)
                 }
-                llm_parse_outputs[str(rid)] = rec_out
-                out_ref = store.put_json(rec_out, kind="vlm_parse")
-                store.log_event(
-                    stage="parse_llm",
-                    call_kind="model_call",
-                    status="ok",
-                    video_id=row["video_id"],
-                    sample_id=rid,
-                    backend=f"transformers:{torch_dtype}",
-                    device=str(device_map),
-                    duration_sec=dur,
-                    output_refs={"llm_parse": out_ref},
-                )
+            elif n_gpus == 1:
+                load_kwargs["device_map"] = {"": "cuda:0"}
+            else:
+                load_kwargs["device_map"] = {"": "cpu"}
 
-        # 2. VLM visual grounding --notext (geo/vlm_ground.py lines 27-135)
-        vlm_ground_by_video: dict[str, list[dict[str, Any]]] = {}
-        for v_item in spec.get("vlm_ground_videos", []):
-            vid = v_item["video_id"]
-            vpath = Path(v_item["video_path"])
-            v_recs = v_item["parse_v2_records"]
-            consumers = [int(r["id"]) for r in v_recs]
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                str(model_dir),
+                **load_kwargs,
+            ).eval()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            load_sec = time.perf_counter() - t_load0
+            load_vram = _vram_snapshot()
 
-            frames_all = tc.load_video(str(vpath))
-            n_all = len(frames_all)
-            stride = max(1, int(math.ceil(n_all / 160)))
-            fl = list(range(0, n_all, stride))
-            frames = [frames_all[i] for i in fl]
-            del frames_all
-            di = np.unique(np.linspace(0, len(frames) - 1, min(16, len(frames))).round().astype(int)).tolist()
-            pick = [di[int(round(x))] for x in np.linspace(0, len(di) - 1, min(4, len(di)))]
-            h_img, w_img = frames[0].shape[:2]
+            first_dev = model.get_input_embeddings().weight.device
+            device_map_repr = str(getattr(model, "hf_device_map", load_kwargs["device_map"]))
+            gen_kwargs = {
+                "do_sample": False,
+                "temperature": None,
+                "top_p": None,
+                "top_k": None,
+            }
 
-            # Build queries_for exactly as in geo/vlm_ground.py
-            qs_map: dict[str, dict[str, Any]] = {}
-
-            def _add_vg(ent: dict[str, Any] | None, role: str) -> str | None:
-                if not ent or not ent.get("phrase"):
-                    return None
-                rel = ent.get("rel")
-                k = ent["phrase"] + "|" + ",".join(ent.get("where") or []) + ("|" + rel[0] + ":" + rel[1] if rel else "")
-                if k not in qs_map:
-                    qs_map[k] = {
-                        "key": k,
-                        "phrase": ent["phrase"],
-                        "where": list(ent.get("where") or []),
-                        "rel": rel,
-                        "roles": [],
-                        "raw": set(),
-                    }
-                if role not in qs_map[k]["roles"]:
-                    qs_map[k]["roles"].append(role)
-                if ent.get("raw"):
-                    qs_map[k]["raw"].add(ent["raw"])
-                if rel:
-                    _add_vg({"phrase": rel[1], "where": [], "raw": rel[1]}, "ref")
-                return k
-
-            for r in v_recs:
-                _add_vg(r["target"], "dist" if r["q"]["kind"] == "dist2" else "target")
-                if r.get("target2"):
-                    _add_vg(r["target2"], "dist" if r["q"]["kind"] == "dist2" else "target2")
-                if r.get("prior_obj") and r["prior_obj"].get("phrase"):
-                    _add_vg(r["prior_obj"], "prior")
-
-            vid_records: list[dict[str, Any]] = []
-            for q in qs_map.values():
-                raws = sorted(q["raw"], key=len, reverse=True)
-                expr = raws[0] if raws else q["phrase"]
-                for wx in [x for x in q["where"] if x != "#second"]:
-                    if wx not in expr:
-                        expr = f"{wx} {expr}"
-                expr = re.sub(r"\s+", " ", expr).strip()
-                if "#second" in q["where"]:
-                    prompt_txt = (
-                        f'Locate every instance of "{q["phrase"]}" in the image. Report all of their bounding boxes in JSON format, '
-                        f'as a list [{{"bbox_2d": [x1, y1, x2, y2], "label": "{q["phrase"]}"}}, ...]. If there is none, output [].'
+            # 1. Optional LLM fallback parse (geo/parse.py lines 32-72)
+            llm_parse_outputs: dict[str, Any] = {}
+            if spec.get("run_llm_parse", False):
+                for row in spec.get("parse_rows", []):
+                    assert "ground_truth_posterior" not in row
+                    rid = int(row["id"])
+                    dep = rules_v1.parse_depth(row.get("depth_info", "")) if str(row["video_type"])[1] == "3" else []
+                    dkeys = sorted({d["key"] for d in dep})
+                    user_prompt = parse_v1.build_prompt(
+                        rules_v1.clean_text(row["question"]),
+                        rules_v1.clean_text(row["ground_truth_prior"]).replace("\n", "; "),
+                        dkeys,
                     )
-                else:
-                    expr_nt = expr + " (the object itself, not a text label or caption naming it)"
-                    prompt_txt = (
-                        f'Locate the {expr_nt} in the image. Report its bounding box in JSON format as '
-                        f'[{{"bbox_2d": [x1, y1, x2, y2], "label": "{q["phrase"]}"}}]. If it is not in the image, output [].'
-                    )
-                msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_txt}]}]
-                rendered = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-                for j in pick:
+                    messages = [
+                        {"role": "system", "content": [{"type": "text", "text": "You are a precise information extraction assistant."}]},
+                        {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+                    ]
+                    rendered = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                     _reset_vram_peaks()
                     t0 = time.perf_counter()
-                    pil_img = Image.fromarray(frames[j])
-                    inp = proc(text=[rendered], images=[pil_img], return_tensors="pt").to(first_dev)
+                    inp = _bind_tensors_to_device(proc(text=[rendered], return_tensors="pt"), first_dev)
                     with torch.inference_mode():
-                        gen_ids = model.generate(**inp, max_new_tokens=256, do_sample=False)
-                    torch.cuda.synchronize()
+                        gen_ids = model.generate(**inp, max_new_tokens=200, **gen_kwargs)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     dur = time.perf_counter() - t0
                     prompt_ids = inp["input_ids"][0].detach().cpu().tolist()
                     out_ids = gen_ids[0, inp["input_ids"].shape[1]:].detach().cpu().tolist()
-                    resp_txt = proc.decode(out_ids, skip_special_tokens=True).strip()
-                    boxes_raw = [
-                        [float(m.group(i)) for i in range(1, 5)]
-                        for m in re.finditer(
-                            r'"bbox_2d"\s*:\s*\[\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\]',
-                            resp_txt,
-                        )
-                    ]
-                    rel_px = [[x0 / 1000.0 * w_img, y0 / 1000.0 * h_img, x1 / 1000.0 * w_img, y1 / 1000.0 * h_img] for x0, y0, x1, y1 in boxes_raw]
-                    boxes_rel1000 = [[round(c, 1) for c in b] for b in rel_px]
-                    frame_ref = store.put_image_rgb(frames[j], kind="vlm_input_frame", meta={"video_id": vid, "j": int(j)})
-                    vg_rec = {
-                        "video_id": vid,
-                        "key": q["key"],
-                        "phrase": q["phrase"],
-                        "where": q["where"],
-                        "roles": q["roles"],
-                        "expr": expr,
-                        "multi": "#second" in q["where"],
-                        "j": int(j),
-                        "source_fidx": int(fl[j]),
-                        "W": int(w_img),
-                        "H": int(h_img),
-                        "prompt": prompt_txt,
-                        "rendered_prompt": rendered,
+                    raw_txt = proc.decode(out_ids, skip_special_tokens=True).strip()
+                    parsed_json = parse_v1.parse_json(raw_txt)
+                    rec_out = {
+                        "id": rid,
                         "model_repo": "Qwen/Qwen3-VL-8B-Instruct",
                         "revision": model_rev,
                         "dtype": str(torch_dtype),
-                        "pixel_values_shape": list(inp["pixel_values"].shape) if "pixel_values" in inp else None,
-                        "image_grid_thw": inp["image_grid_thw"].detach().cpu().tolist() if "image_grid_thw" in inp else None,
+                        "messages": messages,
+                        "rendered_prompt": rendered,
                         "prompt_token_ids": prompt_ids,
                         "output_token_ids": out_ids,
-                        "n_prompt_tokens": len(prompt_ids),
-                        "response": resp_txt,
-                        "boxes_raw": boxes_raw,
-                        "boxes_rel1000": boxes_rel1000,
+                        "raw_response": raw_txt,
+                        "parsed": parsed_json,
                         "duration_sec": round(dur, 4),
                         "vram": _vram_snapshot(),
                     }
-                    vid_records.append(vg_rec)
-                    vg_ref = store.put_json(vg_rec, kind="vlm_ground")
+                    llm_parse_outputs[str(rid)] = rec_out
+                    out_ref = store.put_json(rec_out, kind="vlm_parse")
                     store.log_event(
-                        stage="vlm_ground_notext",
+                        stage="parse_llm",
                         call_kind="model_call",
                         status="ok",
-                        video_id=vid,
-                        consumers=consumers,
+                        video_id=row["video_id"],
+                        sample_id=rid,
                         backend=f"transformers:{torch_dtype}",
-                        device=str(device_map),
+                        device=device_map_repr,
                         duration_sec=dur,
-                        input_refs={"frame_rgb": frame_ref},
-                        output_refs={"vlm_ground_record": vg_ref},
+                        output_refs={"llm_parse": out_ref},
                     )
-            vlm_ground_by_video[vid] = vid_records
 
-        receipt = {
-            "status": "ok",
+            # 2. VLM visual grounding --notext (geo/vlm_ground.py lines 27-135)
+            vlm_ground_by_video: dict[str, list[dict[str, Any]]] = {}
+            for v_item in spec.get("vlm_ground_videos", []):
+                vid = v_item["video_id"]
+                vpath = Path(v_item["video_path"])
+                v_recs = v_item["parse_v2_records"]
+                consumers = [int(r["id"]) for r in v_recs]
+
+                frames_all = tc.load_video(str(vpath))
+                n_all = len(frames_all)
+                stride = max(1, int(math.ceil(n_all / 160)))
+                fl = list(range(0, n_all, stride))
+                frames = [frames_all[i] for i in fl]
+                del frames_all
+                di = np.unique(np.linspace(0, len(frames) - 1, min(16, len(frames))).round().astype(int)).tolist()
+                pick = [di[int(round(x))] for x in np.linspace(0, len(di) - 1, min(4, len(di)))]
+                h_img, w_img = frames[0].shape[:2]
+
+                # Build queries_for exactly as in geo/vlm_ground.py
+                qs_map: dict[str, dict[str, Any]] = {}
+
+                def _add_vg(ent: dict[str, Any] | None, role: str) -> str | None:
+                    if not ent or not ent.get("phrase"):
+                        return None
+                    rel = ent.get("rel")
+                    k = ent["phrase"] + "|" + ",".join(ent.get("where") or []) + ("|" + rel[0] + ":" + rel[1] if rel else "")
+                    if k not in qs_map:
+                        qs_map[k] = {
+                            "key": k,
+                            "phrase": ent["phrase"],
+                            "where": list(ent.get("where") or []),
+                            "rel": rel,
+                            "roles": [],
+                            "raw": set(),
+                        }
+                    if role not in qs_map[k]["roles"]:
+                        qs_map[k]["roles"].append(role)
+                    if ent.get("raw"):
+                        qs_map[k]["raw"].add(ent["raw"])
+                    if rel:
+                        _add_vg({"phrase": rel[1], "where": [], "raw": rel[1]}, "ref")
+                    return k
+
+                for r in v_recs:
+                    _add_vg(r["target"], "dist" if r["q"]["kind"] == "dist2" else "target")
+                    if r.get("target2"):
+                        _add_vg(r["target2"], "dist" if r["q"]["kind"] == "dist2" else "target2")
+                    if r.get("prior_obj") and r["prior_obj"].get("phrase"):
+                        _add_vg(r["prior_obj"], "prior")
+
+                vid_records: list[dict[str, Any]] = []
+                for q in qs_map.values():
+                    raws = sorted(q["raw"], key=len, reverse=True)
+                    expr = raws[0] if raws else q["phrase"]
+                    for wx in [x for x in q["where"] if x != "#second"]:
+                        if wx not in expr:
+                            expr = f"{wx} {expr}"
+                    expr = re.sub(r"\s+", " ", expr).strip()
+                    if "#second" in q["where"]:
+                        prompt_txt = (
+                            f'Locate every instance of "{q["phrase"]}" in the image. Report all of their bounding boxes in JSON format, '
+                            f'as a list [{{"bbox_2d": [x1, y1, x2, y2], "label": "{q["phrase"]}"}}, ...]. If there is none, output [].'
+                        )
+                    else:
+                        expr_nt = expr + " (the object itself, not a text label or caption naming it)"
+                        prompt_txt = (
+                            f'Locate the {expr_nt} in the image. Report its bounding box in JSON format as '
+                            f'[{{"bbox_2d": [x1, y1, x2, y2], "label": "{q["phrase"]}"}}]. If it is not in the image, output [].'
+                        )
+                    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_txt}]}]
+                    rendered = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+                    for j in pick:
+                        _reset_vram_peaks()
+                        t0 = time.perf_counter()
+                        pil_img = Image.fromarray(frames[j])
+                        inp = _bind_tensors_to_device(proc(text=[rendered], images=[pil_img], return_tensors="pt"), first_dev)
+                        with torch.inference_mode():
+                            gen_ids = model.generate(**inp, max_new_tokens=256, **gen_kwargs)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        dur = time.perf_counter() - t0
+                        prompt_ids = inp["input_ids"][0].detach().cpu().tolist()
+                        out_ids = gen_ids[0, inp["input_ids"].shape[1]:].detach().cpu().tolist()
+                        resp_txt = proc.decode(out_ids, skip_special_tokens=True).strip()
+                        boxes_raw = [
+                            [float(m.group(i)) for i in range(1, 5)]
+                            for m in re.finditer(
+                                r'"bbox_2d"\s*:\s*\[\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\]',
+                                resp_txt,
+                            )
+                        ]
+                        rel_px = [[x0 / 1000.0 * w_img, y0 / 1000.0 * h_img, x1 / 1000.0 * w_img, y1 / 1000.0 * h_img] for x0, y0, x1, y1 in boxes_raw]
+                        boxes_rel1000 = [[round(c, 1) for c in b] for b in rel_px]
+                        frame_ref = store.put_image_rgb(frames[j], kind="vlm_input_frame", meta={"video_id": vid, "j": int(j)})
+                        vg_rec = {
+                            "video_id": vid,
+                            "key": q["key"],
+                            "phrase": q["phrase"],
+                            "where": q["where"],
+                            "roles": q["roles"],
+                            "expr": expr,
+                            "multi": "#second" in q["where"],
+                            "j": int(j),
+                            "source_fidx": int(fl[j]),
+                            "W": int(w_img),
+                            "H": int(h_img),
+                            "prompt": prompt_txt,
+                            "rendered_prompt": rendered,
+                            "model_repo": "Qwen/Qwen3-VL-8B-Instruct",
+                            "revision": model_rev,
+                            "dtype": str(torch_dtype),
+                            "pixel_values_shape": list(inp["pixel_values"].shape) if "pixel_values" in inp else None,
+                            "image_grid_thw": inp["image_grid_thw"].detach().cpu().tolist() if "image_grid_thw" in inp else None,
+                            "prompt_token_ids": prompt_ids,
+                            "output_token_ids": out_ids,
+                            "n_prompt_tokens": len(prompt_ids),
+                            "response": resp_txt,
+                            "boxes_raw": boxes_raw,
+                            "boxes_rel1000": boxes_rel1000,
+                            "duration_sec": round(dur, 4),
+                            "vram": _vram_snapshot(),
+                        }
+                        vid_records.append(vg_rec)
+                        vg_ref = store.put_json(vg_rec, kind="vlm_ground")
+                        store.log_event(
+                            stage="vlm_ground_notext",
+                            call_kind="model_call",
+                            status="ok",
+                            video_id=vid,
+                            consumers=consumers,
+                            backend=f"transformers:{torch_dtype}",
+                            device=device_map_repr,
+                            duration_sec=dur,
+                            input_refs={"frame_rgb": frame_ref},
+                            output_refs={"vlm_ground_record": vg_ref},
+                        )
+                vlm_ground_by_video[vid] = vid_records
+
+            receipt = {
+                "status": "ok",
+                "stage": "vlm_stage",
+                "load_duration_sec": round(load_sec, 4),
+                "load_vram": load_vram,
+                "final_vram": _vram_snapshot(),
+                "llm_parse_outputs": llm_parse_outputs,
+                "vlm_ground_by_video": vlm_ground_by_video,
+                "errors": [],
+                "completed_at": utc_now_iso(),
+            }
+            write_json_atomic(Path(spec["receipt_path"]), receipt)
+            return receipt
+    except Exception as exc:
+        tb = traceback.format_exc()
+        err_rec = {
+            "worker": "vlm-worker",
             "stage": "vlm_stage",
-            "load_duration_sec": round(load_sec, 4),
-            "load_vram": load_vram,
-            "final_vram": _vram_snapshot(),
-            "llm_parse_outputs": llm_parse_outputs,
-            "vlm_ground_by_video": vlm_ground_by_video,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": tb,
+            "run_dir": str(run_dir),
+        }
+        store.log_event(
+            stage="vlm_stage",
+            call_kind="model_call",
+            status="error",
+            backend=f"transformers:{spec.get('dtype_profile', 't4_fp16')}",
+            device="cuda",
+            error=err_rec["error"],
+        )
+        print(f"[FIRST WORKER ERROR] worker=vlm-worker stage=vlm_stage\n{tb}", file=sys.stderr, flush=True)
+        receipt = {
+            "status": "error",
+            "stage": "vlm_stage",
+            "llm_parse_outputs": {},
+            "vlm_ground_by_video": {},
+            "errors": [err_rec],
             "completed_at": utc_now_iso(),
         }
         write_json_atomic(Path(spec["receipt_path"]), receipt)
-        _free_cuda(model, proc)
         return receipt
+    finally:
+        _free_cuda(model, proc)
 
 
 # =============================================================================
@@ -418,9 +488,10 @@ def _run_gdino_instrumented(
 
     _reset_vram_peaks()
     t_load0 = time.perf_counter()
-    gp = AutoProcessor.from_pretrained(str(model_dir))
-    gm = GroundingDinoForObjectDetection.from_pretrained(str(model_dir)).to(device).eval()
-    torch.cuda.synchronize()
+    gp = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
+    gm = GroundingDinoForObjectDetection.from_pretrained(str(model_dir), local_files_only=True).to(device).eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     load_sec = time.perf_counter() - t_load0
     load_vram = _vram_snapshot()
 
@@ -468,7 +539,11 @@ def _run_gdino_instrumented(
                 out.logits = out.logits.float()
                 out.pred_boxes = out.pred_boxes.float()
                 res = gp.post_process_grounded_object_detection(
-                    out, tok.input_ids, threshold=thr, text_threshold=thr, target_sizes=[(H, W)]
+                    outputs=out,
+                    input_ids=tok.input_ids,
+                    threshold=thr,
+                    text_threshold=thr,
+                    target_sizes=[(H, W)],
                 )[0]
                 b_raw = res["boxes"].cpu().numpy().astype(float)
                 sc_raw = res["scores"].cpu().numpy().astype(float)
@@ -488,7 +563,8 @@ def _run_gdino_instrumented(
             dets_by_phrase[ph] = ph_dets
             raw_candidates_trace[ph] = ph_trace
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     inf_sec = time.perf_counter() - t_inf0
     peak_vram = _vram_snapshot()
     del gm, gp
@@ -530,9 +606,10 @@ def _run_owlv2_instrumented(
 
     _reset_vram_peaks()
     t_load0 = time.perf_counter()
-    op = Owlv2Processor.from_pretrained(str(model_dir))
-    om = Owlv2ForObjectDetection.from_pretrained(str(model_dir)).to(device).eval()
-    torch.cuda.synchronize()
+    op = Owlv2Processor.from_pretrained(str(model_dir), local_files_only=True)
+    om = Owlv2ForObjectDetection.from_pretrained(str(model_dir), local_files_only=True).to(device).eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     load_sec = time.perf_counter() - t_load0
     load_vram = _vram_snapshot()
 
@@ -580,7 +657,8 @@ def _run_owlv2_instrumented(
             out_all.append(d_frame)
             frame_traces.append({"det_slot": k_idx, "frame_idx": int(fi), "by_phrase": tr_frame})
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     inf_sec = time.perf_counter() - t_inf0
     peak_vram = _vram_snapshot()
     del om, op
@@ -618,9 +696,10 @@ def _run_sam2_instrumented(
     sam_dtype = torch.bfloat16 if dtype_profile == "upstream_bf16" else (torch.float32 if dtype_profile == "fp32" else torch.float16)
     _reset_vram_peaks()
     t_load0 = time.perf_counter()
-    sp = Sam2VideoProcessor.from_pretrained(str(model_dir))
-    sm = Sam2VideoModel.from_pretrained(str(model_dir)).to(device, dtype=sam_dtype).eval()
-    torch.cuda.synchronize()
+    sp = Sam2VideoProcessor.from_pretrained(str(model_dir), local_files_only=True)
+    sm = Sam2VideoModel.from_pretrained(str(model_dir), local_files_only=True).to(device, dtype=sam_dtype).eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     load_sec = time.perf_counter() - t_load0
     load_vram = _vram_snapshot()
 
@@ -629,79 +708,58 @@ def _run_sam2_instrumented(
     for oid, fi, b in anchors:
         groups.setdefault(int(fi), []).append((int(oid), [float(v) for v in b]))
 
+    def _propagate_group(fi_val: int, ob_list: list[tuple[int, list[float]]], cur_dtype: Any) -> None:
+        sess = sp.init_video_session(video=frames, inference_device=device, dtype=cur_dtype)
+        ids = [oid + 1 for oid, _ in ob_list]
+        sp.add_inputs_to_inference_session(
+            inference_session=sess,
+            frame_idx=fi_val,
+            obj_ids=ids,
+            input_boxes=[[b for _, b in ob_list]],
+        )
+        for rev in (False, True):
+            for o in sm.propagate_in_video_iterator(sess, start_frame_idx=fi_val, reverse=rev):
+                if rev and o.frame_idx == fi_val:
+                    continue
+                m = sp.post_process_masks(
+                    [o.pred_masks],
+                    original_sizes=[[sess.video_height, sess.video_width]],
+                    binarize=False,
+                )[0]
+                m_bin = (m[:, 0] > 0).cpu().numpy()
+                lg = o.object_score_logits.float().cpu().numpy().ravel()
+                for j_idx, oid_plus1 in enumerate(o.object_ids):
+                    if lg[j_idx] > 0:
+                        st = tc.mask_stats(m_bin[j_idx])
+                        poly = tc.mask_poly(m_bin[j_idx]) if (st and keep_all_polys) else None
+                        col = tc.mask_colors(frames[int(o.frame_idx)], m_bin[j_idx]) if (st and int(o.frame_idx) == fi_val) else None
+                    else:
+                        st, poly, col = None, None, None
+                    res.setdefault(int(oid_plus1) - 1, {})[int(o.frame_idx)] = (st, float(lg[j_idx]), poly, col)
+        del sess
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     t_inf0 = time.perf_counter()
     used_dtype_str = str(sam_dtype)
     with torch.no_grad():
         for fi, ob in groups.items():
             try:
-                sess = sp.init_video_session(video=frames, inference_device=device, dtype=sam_dtype)
-                ids = [oid + 1 for oid, _ in ob]
-                sp.add_inputs_to_inference_session(
-                    inference_session=sess,
-                    frame_idx=fi,
-                    obj_ids=ids,
-                    input_boxes=[[b for _, b in ob]],
-                )
-                for rev in (False, True):
-                    for o in sm.propagate_in_video_iterator(sess, start_frame_idx=fi, reverse=rev):
-                        if rev and o.frame_idx == fi:
-                            continue
-                        m = sp.post_process_masks(
-                            [o.pred_masks],
-                            original_sizes=[[sess.video_height, sess.video_width]],
-                            binarize=False,
-                        )[0]
-                        m_bin = (m[:, 0] > 0).cpu().numpy()
-                        lg = o.object_score_logits.float().cpu().numpy().ravel()
-                        for j_idx, oid_plus1 in enumerate(o.object_ids):
-                            if lg[j_idx] > 0:
-                                st = tc.mask_stats(m_bin[j_idx])
-                                poly = tc.mask_poly(m_bin[j_idx]) if (st and keep_all_polys) else None
-                                col = tc.mask_colors(frames[int(o.frame_idx)], m_bin[j_idx]) if (st and int(o.frame_idx) == fi) else None
-                            else:
-                                st, poly, col = None, None, None
-                            res.setdefault(int(oid_plus1) - 1, {})[int(o.frame_idx)] = (st, float(lg[j_idx]), poly, col)
-                del sess
-                torch.cuda.empty_cache()
-            except RuntimeError as exc:
-                # Automatic FP32 fallback on Turing SM 7.5 if any SAM2 op rejects FP16
-                if sam_dtype != torch.float32:
+                _propagate_group(fi, ob, sam_dtype)
+            except (RuntimeError, TypeError, ValueError) as exc:
+                # Automatic FP32 fallback on Turing SM 7.5 if any SAM2 op rejects FP16/BF16
+                if sam_dtype != torch.float32 and "out of memory" not in str(exc).lower():
+                    for oid_clean, _ in ob:
+                        res.pop(int(oid_clean), None)
                     sam_dtype = torch.float32
-                    used_dtype_str = "torch.float32(fallback_from_fp16)"
+                    used_dtype_str = "torch.float32(fallback_from_half)"
                     sm = sm.to(device, dtype=torch.float32).eval()
-                    sess = sp.init_video_session(video=frames, inference_device=device, dtype=torch.float32)
-                    ids = [oid + 1 for oid, _ in ob]
-                    sp.add_inputs_to_inference_session(
-                        inference_session=sess,
-                        frame_idx=fi,
-                        obj_ids=ids,
-                        input_boxes=[[b for _, b in ob]],
-                    )
-                    for rev in (False, True):
-                        for o in sm.propagate_in_video_iterator(sess, start_frame_idx=fi, reverse=rev):
-                            if rev and o.frame_idx == fi:
-                                continue
-                            m = sp.post_process_masks(
-                                [o.pred_masks],
-                                original_sizes=[[sess.video_height, sess.video_width]],
-                                binarize=False,
-                            )[0]
-                            m_bin = (m[:, 0] > 0).cpu().numpy()
-                            lg = o.object_score_logits.float().cpu().numpy().ravel()
-                            for j_idx, oid_plus1 in enumerate(o.object_ids):
-                                if lg[j_idx] > 0:
-                                    st = tc.mask_stats(m_bin[j_idx])
-                                    poly = tc.mask_poly(m_bin[j_idx]) if (st and keep_all_polys) else None
-                                    col = tc.mask_colors(frames[int(o.frame_idx)], m_bin[j_idx]) if (st and int(o.frame_idx) == fi) else None
-                                else:
-                                    st, poly, col = None, None, None
-                                res.setdefault(int(oid_plus1) - 1, {})[int(o.frame_idx)] = (st, float(lg[j_idx]), poly, col)
-                    del sess
-                    torch.cuda.empty_cache()
+                    _propagate_group(fi, ob, torch.float32)
                 else:
-                    raise exc
+                    raise
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     inf_sec = time.perf_counter() - t_inf0
     peak_vram = _vram_snapshot()
     del sm, sp
@@ -1111,23 +1169,50 @@ def run_track_stage_worker(work_json_path: Path) -> dict[str, Any]:
     set_deterministic_seeds(int(spec.get("seed", 0)))
     dtype_profile = spec.get("dtype_profile", "t4_fp16")
 
-    # Upstream geo/track.py executes main() at top-level import unless we only import functions cleanly;
-    # load track_common & measure first, and import track_v1/v2 helper functions safely without running main().
-    mods = _load_upstream_geo_modules(UPSTREAM_DIR)
-    tc = mods["tc"]
-    m1 = mods["m1"]
-
-    # Provide non-executing module shims for track_v1.choose/queries_for and track_v2.select_anchors/queries_for
-    _install_safe_track_modules(UPSTREAM_DIR)
-
-    gdino_dir = Path(spec["models"]["grounding_dino"])
-    owl_dir = Path(spec["models"]["owlv2"])
-    sam2_dir = Path(spec["models"]["sam2"])
-    cache_dir = Path(spec["track_cache_dir"])
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
     video_results: dict[str, Any] = {}
     worker_errors: list[dict[str, Any]] = []
+
+    try:
+        # Upstream geo/track.py executes main() at top-level import unless we extract pure helpers via AST;
+        # load track_common & measure first, and install safe pure-CPU track_v1/v2 helper modules.
+        mods = _load_upstream_geo_modules(UPSTREAM_DIR)
+        tc = mods["tc"]
+        m1 = mods["m1"]
+        _install_safe_track_modules(UPSTREAM_DIR)
+
+        gdino_dir = Path(spec["models"]["grounding_dino"])
+        owl_dir = Path(spec["models"]["owlv2"])
+        sam2_dir = Path(spec["models"]["sam2"])
+        cache_dir = Path(spec["track_cache_dir"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as setup_exc:
+        tb = traceback.format_exc()
+        err_rec = {
+            "worker": worker_name,
+            "stage": "track_worker_setup",
+            "error": f"{type(setup_exc).__name__}: {setup_exc}",
+            "traceback": tb,
+            "run_dir": str(run_dir),
+        }
+        worker_errors.append(err_rec)
+        store.log_event(
+            stage="track_worker_setup",
+            call_kind="tool_call",
+            status="error",
+            backend=f"transformers:{dtype_profile}",
+            device=worker_name,
+            error=err_rec["error"],
+        )
+        print(f"[FIRST WORKER ERROR] worker={worker_name} stage=track_worker_setup\n{tb}", file=sys.stderr, flush=True)
+        receipt = {
+            "status": "error",
+            "worker_name": worker_name,
+            "video_results": {},
+            "errors": worker_errors,
+            "completed_at": utc_now_iso(),
+        }
+        write_json_atomic(Path(spec["receipt_path"]), receipt)
+        return receipt
 
     with FreshAntiCacheGuard(enabled=True):
         for v_item in spec["videos"]:
@@ -1429,42 +1514,61 @@ def run_track_stage_worker(work_json_path: Path) -> dict[str, Any]:
     return receipt
 
 
+def _extract_pure_ast_module(
+    py_path: Path,
+    mod_name: str,
+    keep_assigns: set[str],
+    keep_funcs: set[str],
+    extra_globals: dict[str, Any],
+) -> types.ModuleType:
+    """Compile only specified pure-CPU constants and undecorated functions from an upstream script."""
+    tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+    selected: list[ast.stmt] = []
+    found_funcs: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if targets & keep_assigns:
+                selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in keep_funcs:
+            if node.decorator_list:
+                raise ValueError(f"Refusing decorated function {node.name} in {py_path}")
+            selected.append(node)
+            found_funcs.add(node.name)
+    missing = keep_funcs - found_funcs
+    if missing:
+        raise RuntimeError(f"Missing expected helper functions {sorted(missing)} in {py_path}")
+    mod_ast = ast.Module(body=selected, type_ignores=[])
+    ast.fix_missing_locations(mod_ast)
+    mod = types.ModuleType(mod_name)
+    mod.__file__ = str(py_path)
+    mod.__dict__.update(extra_globals)
+    exec(compile(mod_ast, str(py_path), "exec"), mod.__dict__)
+    return mod
+
+
 def _install_safe_track_modules(upstream_dir: Path) -> None:
-    """Load pure selection helpers from geo/track.py and geo/track_v2.py without executing their top-level GPU main()."""
-    import types
+    """Load pure selection helpers from geo/track.py and geo/track_v2.py via AST without executing top-level GPU code."""
+    _load_upstream_geo_modules(upstream_dir)
     import track_common as tc
 
     if "track" not in sys.modules:
-        src_v1 = (upstream_dir / "geo" / "track.py").read_text(encoding="utf-8")
-        # Extract pure functions color_frac, choose, mask_stats, queries_for (lines 79-232)
-        cut_start = src_v1.index("COLOR_WORDS =")
-        cut_end = src_v1.index("@torch.no_grad()\ndef sam2_track")
-        q_start = src_v1.index("def queries_for(recs):")
-        q_end = src_v1.index("def main():")
-        mod_v1 = types.ModuleType("track")
-        exec("import re, math\nimport numpy as np, cv2\nfrom track_common import iou, nms\n" + src_v1[cut_start:cut_end] + "\n" + src_v1[q_start:q_end], mod_v1.__dict__)
-        sys.modules["track"] = mod_v1
+        sys.modules["track"] = _extract_pure_ast_module(
+            py_path=upstream_dir / "geo" / "track.py",
+            mod_name="track",
+            keep_assigns={"COLOR_WORDS"},
+            keep_funcs={"iou", "nms", "color_frac", "choose", "mask_stats", "camera_motion", "queries_for"},
+            extra_globals={"re": re, "math": math, "np": np, "cv2": cv2},
+        )
 
     if "track_v2" not in sys.modules:
-        src_v2 = (upstream_dir / "geo" / "track_v2.py").read_text(encoding="utf-8")
-        s_start = src_v2.index("COLOR_WORDS = tc.COLOR_WORDS")
-        s_end = src_v2.index("@torch.no_grad()\ndef gdino")
-        mid_start = src_v2.index("def owl_support(box, owl_dets):")
-        mid_end = src_v2.index("if args.det_calib:")
-        sel_start = src_v2.index("def heads(p):")
-        sel_end = src_v2.index("@torch.no_grad()\ndef sam2_track")
-        mod_v2 = types.ModuleType("track_v2")
-        mod_v2.__dict__["tc"] = tc
-        exec(
-            "import re, math\nimport numpy as np\n"
-            + src_v2[s_start:s_end]
-            + "\n"
-            + src_v2[mid_start:mid_end]
-            + "\n"
-            + src_v2[sel_start:sel_end],
-            mod_v2.__dict__,
+        sys.modules["track_v2"] = _extract_pure_ast_module(
+            py_path=upstream_dir / "geo" / "track_v2.py",
+            mod_name="track_v2",
+            keep_assigns={"COLOR_WORDS", "CONTRAST"},
+            keep_funcs={"owl_support", "vote", "heads", "contrastive", "rel_pick", "choose", "queries_for", "select_anchors"},
+            extra_globals={"re": re, "math": math, "np": np, "tc": tc},
         )
-        sys.modules["track_v2"] = mod_v2
 
 
 def main() -> None:
