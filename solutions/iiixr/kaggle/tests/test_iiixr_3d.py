@@ -29,6 +29,30 @@ class ThreeDTests(unittest.TestCase):
         self.assertEqual(results[2607]["decision"]["meas_why"], "part_target")
         self.assertEqual(results[2607]["parsed_value"], 44.0)
 
+    def test_legacy_validation_csv_keeps_question_ids_and_scores_replay(self):
+        reference = data.csv_bytes(data.pinned_member(data.REFERENCE))
+        csv_path = self.root / "validation_dataset.csv"
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["", *data.FIELDS[1:], "ground_truth_posterior", *([""] * 17)])
+            for row in reference.values():
+                values = [str(row[field]).replace("\n", "\r\n") for field in data.FIELDS]
+                writer.writerow([*values, row["ground_truth_posterior"], "", "#NAME?", *([""] * 15)])
+
+        inputs, provenance, official = data.resolve_inputs(self.root, self.root, False)
+        self.assertTrue(provenance["official_compared"])
+        self.assertEqual(len(inputs), 90)
+        self.assertEqual(len(inputs[2607]["depth_info"].splitlines()), 4)
+        self.assertEqual(official, csv_path)
+        questions = [inputs[q] for q in data.SANITY_IDS]
+        clips = {row["video_id"]: {"status": "missing"} for row in questions}
+        manifest = data.question_manifest(questions, clips)
+        results, stages = report.replay(self.root, sorted(data.SANITY_IDS))
+        workflow.seal(self.root, manifest, results, "replay", "sanity", stages)
+        evaluation = report.evaluate(self.root, official)
+        self.assertEqual(evaluation["all"]["scored_n"], 4)
+        self.assertAlmostEqual(evaluation["all"]["mra"], 0.675)
+
     def test_clean_worker_runs_actual_rejection_and_arbitration(self):
         for name in ("geo/out/tracks_val", "preds", "models", "data/val/validation_videos",
                      "caw/sc/inputs", "caw/sc/out/val_ruler"):

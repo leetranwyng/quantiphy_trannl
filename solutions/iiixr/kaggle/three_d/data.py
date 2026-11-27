@@ -36,17 +36,30 @@ def finite(value):
 
 
 def rows(stream):
-    reader = csv.DictReader(stream)
-    if not reader.fieldnames or reader.fieldnames[0] not in ("", "id", "Unnamed: 0"):
-        raise ValueError(f"Expected a question ID in the first column: {reader.fieldnames}")
+    reader = csv.reader(stream)
+    header = next(reader, [])
+    if not header or header[0] not in ("", "id", "Unnamed: 0"):
+        raise ValueError(f"Expected a question ID in the first column: {header}")
+    # The original validation CSV uses an empty ID header and repeats it on
+    # trailing spreadsheet columns. Read by position so they cannot replace the ID.
+    columns = [(index, field) for index, field in enumerate(header[1:], 1) if field.strip()]
+    named_fields = {"id", *(field for _, field in columns)}
+    if len(named_fields) != len(columns) + 1:
+        raise ValueError(f"Duplicate named CSV columns: {header}")
+    last_named = columns[-1][0] if columns else 0
     by_id = {}
-    for row in reader:
-        if None in row or None in row.values():
+    for cells in reader:
+        if not cells:
+            continue
+        if not last_named < len(cells) <= len(header):
             raise ValueError(f"Malformed CSV record ending on line {reader.line_num}")
-        identity = int(row.pop(reader.fieldnames[0]))
+        try:
+            identity = int(cells[0])
+        except ValueError as exc:
+            raise ValueError(f"Invalid question ID {cells[0]!r} on CSV record ending on line {reader.line_num}") from exc
         if identity in by_id:
             raise ValueError(f"Duplicate question ID {identity}")
-        by_id[identity] = {"id": identity, **row}
+        by_id[identity] = {"id": identity, **{field: cells[index] for index, field in columns}}
     return by_id
 
 
@@ -62,7 +75,8 @@ def csv_bytes(data):
 
 
 def select(by_id):
-    return {identity: {field: row[field].strip() if field != "id" else identity for field in FIELDS}
+    return {identity: {"id": identity, **{field: row[field].replace("\r\n", "\n").replace("\r", "\n").strip()
+                                        for field in FIELDS[1:]}}
             for identity, row in by_id.items() if row["video_type"].strip()[:2] in EXPECTED}
 
 
