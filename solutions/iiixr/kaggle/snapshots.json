@@ -1,0 +1,152 @@
+{
+  "upstream": {
+    "repo_url": "https://github.com/seoneun/NeurIPS-2026-QuantiPhy-Challenge-IIIXR.git",
+    "fork_url": null,
+    "pinned_commit": "ec4bfc15e9d5d1372bea0ecafdadf54c6e38b378",
+    "license_status": "NO_EXPLICIT_LICENSE_FILE_IN_UPSTREAM (GitHub default copyright; third-party model licenses listed in MODELS.md)",
+    "subtree_prefix": "solutions/iiixr/upstream",
+    "intermediates_archive": {
+      "path": "intermediates/intermediates.tar.xz",
+      "bytes": 18034700,
+      "sha256": "95fe56c2348af5ad88d7265e6ec43feb2488204f43444466697f537d04490b39"
+    },
+    "owl_threshold_v2": {
+      "member": "geo/out/owl_threshold_v2.json",
+      "bytes": 45,
+      "sha256": "3ad624f04df22509b6b16330363c98ce21401fede20e037884ebeafe972c017e",
+      "T_owl": 0.09807931631803513
+    }
+  },
+  "caw_baseline": {
+    "pinned_commit": "fb5eec359d8cf1757e6675e56fea65282ee85c51",
+    "archive_name": "quantiphy_full.tar",
+    "predictions_member": "run/predictions.csv",
+    "validation_csv_member": "run/configs/quantiphy_validation.csv",
+    "expected_158_macro_mra": 0.4838907058654399,
+    "expected_18_subset_mean_mra": 0.4277777777777778
+  },
+  "benchmark": {
+    "repo_url": "https://github.com/Paulineli/QuantiPhy.git",
+    "revision": "aa8daa7a5736ce3514ed985189ad27ef4a2e6e68",
+    "validation_csv": {
+      "name": "quantiphy_validation.csv",
+      "bytes": 40809,
+      "sha256": "4f29907c256371b998cf5f5b71287c12e2b3a60a87bacbb288036ffd35a1dc11",
+      "rows": 158
+    }
+  },
+  "dataset": {
+    "repo_id": "PaulineLi/QuantiPhy-validation",
+    "iiixr_revision": "74aec82473912ccab6a589645a39fcd0e78ee23c",
+    "caw_compatible_revision": "2d56ff31c22c12bf377b2c2092ff229d291fd830",
+    "target_videos": {
+      "simulation_0089": {
+        "snapshot_path": "validation_videos/simulation_0089.mp4",
+        "bytes": 50349,
+        "sha256": "deeb3f0b264216a8bd8b75de1a741386a6e289f48263ff9636c752d4e674b157",
+        "width": 854,
+        "height": 480,
+        "frames": 30,
+        "csv_fps": 24.0,
+        "file_fps": 24.0
+      },
+      "simulation_0163": {
+        "snapshot_path": "validation_videos/simulation_0163.mp4",
+        "bytes": 237595,
+        "sha256": "687c8ff21b2452864a50810e43cd952785abfe11daa6cbde50bce54a9d376edd",
+        "width": 854,
+        "height": 480,
+        "frames": 51,
+        "csv_fps": 24.0,
+        "file_fps": 24.0
+      },
+      "simulation_0171": {
+        "snapshot_path": "validation_videos/simulation_0171.mp4",
+        "bytes": 189479,
+        "sha256": "503b49400eae6bab5179092acc50862fb1355f499b22a24e1188025630a18d86",
+        "width": 854,
+        "height": 480,
+        "frames": 80,
+        "csv_fps": 24.0,
+        "file_fps": 24.0
+      },
+      "simulation_0098_segmented": {
+        "snapshot_path": "validation_videos/simulation_0098_segmented.mp4",
+        "bytes": 192085,
+        "sha256": "0ee3da32703a6876d430efbdccc2c872e29148e55c6d3dee92df677bf52b180b",
+        "width": 854,
+        "height": 480,
+        "frames": 73,
+        "csv_fps": 24.0,
+        "file_fps": 24.0
+      },
+      "internet_0001": {
+        "snapshot_path": "validation_videos/internet_0001.mp4",
+        "bytes": 105131,
+        "sha256": "79c035962361884f49233ee3fa8be67b2daeef96c983ab71dffa9fcd189c60c9",
+        "width": 854,
+        "height": 480,
+        "frames": 31,
+        "csv_fps": 24.0,
+        "file_fps": 23.976
+      },
+      "internet_0019": {
+        "snapshot_path": "validation_videos/internet_0019.mp4",
+        "bytes": 118768,
+        "sha256": "0e8e0e78e29545d695a620cf794de158f33255b731940471c0c34f6962d99f9d",
+        "width": 854,
+        "height": 480,
+        "frames": 40,
+        "csv_fps": 30.0,
+        "file_fps": 30.0
+      }
+    }
+  },
+  "models": {
+    "grounding_dino": {
+      "repo_id": "IDEA-Research/grounding-dino-base",
+      "revision": "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
+      "license": "Apache-2.0",
+      "allow_patterns": ["*.json", "*.txt", "model.safetensors"],
+      "used_in_stages": ["track_v1", "track_v2"],
+      "single_t4_compatible": true
+    },
+    "owlv2": {
+      "repo_id": "google/owlv2-base-patch16-ensemble",
+      "revision": "cfd3195ba4ea9592eec887ded089f4c08eff231d",
+      "license": "Apache-2.0",
+      "allow_patterns": ["*.json", "*.txt", "model.safetensors"],
+      "used_in_stages": ["track_v2"],
+      "single_t4_compatible": true
+    },
+    "sam2": {
+      "repo_id": "facebook/sam2.1-hiera-large",
+      "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+      "license": "Apache-2.0",
+      "allow_patterns": ["*.json", "*.txt", "model.safetensors"],
+      "used_in_stages": ["track_v1", "track_v2", "track_v3"],
+      "single_t4_compatible": true
+    },
+    "qwen3_vl_8b": {
+      "repo_id": "Qwen/Qwen3-VL-8B-Instruct",
+      "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+      "license": "Apache-2.0",
+      "allow_patterns": ["*.json", "*.txt", "*.jinja", "merges.txt", "vocab.json", "*.safetensors"],
+      "used_in_stages": ["parse_llm_optional", "vlm_ground_notext"],
+      "single_t4_compatible": false,
+      "two_t4_sharded_fp16": true
+    }
+  },
+  "excluded_models_not_in_g_box": [
+    "MirroS-Lab/Code-as-World-VL-9B",
+    "allenai/Molmo2-8B",
+    "ByteDance/Sa2VA-Qwen3-VL-4B-SAM3",
+    "Ruicheng/moge-2-vitl-normal",
+    "lpiccinelli/unidepth-v2-vitl14",
+    "facebook/VGGT-1B",
+    "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+    "apple/DepthPro",
+    "facebook/cotracker3 (used only by missing g_pt audit branch, never by g_box)",
+    "moonshotai/Kimi-K2.5"
+  ]
+}

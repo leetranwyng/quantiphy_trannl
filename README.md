@@ -1,3 +1,32 @@
+# QuantiPhy Multi-Solution Workspace (`quantiphy_trannl`)
+
+Repository này tổ chức các lời giải và pipeline truy vết (intermediate trace & failure analysis) cho bài toán **QuantiPhy Physical Reasoning Challenge**, được đóng gói để chạy độc lập trên **Kaggle GPU T4 ×2** và kiểm tra lại hoàn toàn offline.
+
+## Mục lục các Solution trong Repository
+
+| Đường dẫn | Lời giải / Nội dung | Entry Point / Notebook Kaggle | Ghi chú môi trường & phạm vi |
+|---|---|---|---|
+| `code_as_world/`, `notebooks/quantiphy_caw_*.ipynb` | **Baseline Code-as-World (`Code-as-World-VL-4B`)** — Đánh giá toàn bộ 158 câu / 24 video validation (`macro-MRA = 0.4838907058654399`). Các thư mục `assets/`, `examples/`, `requirements/`, `code-as-world.pdf`, `LICENSE` ở root phục vụ CAW. | `notebooks/quantiphy_caw_sanity_t4.ipynb`<br/>`notebooks/quantiphy_caw_full_t4.ipynb`<br/>CLI: `python -m code_as_world.kaggle.workflow {sanity,full}` | Giữ nguyên entry point gốc. Viewer CAW hiện có tại `visualization/QuantiPhy_Review.html`. |
+| `solutions/iiixr/` (`upstream/` + `kaggle/`) | **IIIXR 2D Motion (`g_box`, `mode_box=2d_ratio`)** — Tái hiện từ video + câu hỏi gốc, ghi đầy đủ trace từng bước (parse, GroundingDINO/OWLv2/Qwen3-VL-8B, SAM 2.1 mask/box/centroid, Scene Ruler, DP segmentation & đa thức động học) trên 18 câu / 6 video chuẩn, đối chiếu ba cột `cached_box`, `fresh_box`, `caw`. | `solutions/iiixr/kaggle/iiixr_box_sanity_t4.ipynb`<br/>`solutions/iiixr/kaggle/iiixr_box_full_t4.ipynb`<br/>CLI: `python -m solutions.iiixr.kaggle.workflow {replay,sanity,full}` | Pin upstream `ec4bfc15e9d5...` qua Git subtree (`solutions/iiixr/upstream/`, lưu ý upstream chưa có file `LICENSE` riêng). Viewer phân tích lỗi riêng tại `run/index.html` trong `outputs/iiixr/<run_id>/`. |
+| `solutions/jx/`, `solutions/cookie/` | Quy ước thư mục dành sẵn cho các lần nhập tiếp theo (JX LoRA, Cookie `track_b`). | *(Chưa tạo thư mục cho đến khi nhập source/adapter thực tế)* | Giữ môi trường Python và process riêng cho từng đội để tránh xung đột thư viện. |
+
+### Lệnh chạy nhanh
+
+```bash
+# 1. IIIXR — Replay kiểm tra evaluator & đối chiếu cached_box (~0.8389) vs CAW (~0.4278) trên CPU:
+python -m solutions.iiixr.kaggle.workflow replay --caw-tar quantiphy_full.tar --output outputs/iiixr_replay --no-tar
+
+# 2. IIIXR — Chạy bộ unit tests CPU (resolver, hình học/động học tổng hợp, chống đọc cache, CPU trace replay):
+python -m unittest discover -s solutions/iiixr/kaggle/tests -v
+
+# 3. Code-as-World — Kiểm chứng offline archive CAW đã chạy:
+python code_as_world/kaggle/verify.py /path/to/extracted/quantiphy_full/run --require-pass
+```
+
+Xem chi tiết kiến trúc, bảng truy nguồn (`lineage`) và hướng dẫn Kaggle 2×T4 của IIIXR tại [`solutions/iiixr/README.md`](solutions/iiixr/README.md). Phần dưới đây giữ nguyên tài liệu gốc của **Code-as-World**.
+
+---
+
 <p align="center">
   <img src="assets/mirros-logo.png" alt="MirroS logo" width="200">
 </p>
@@ -119,8 +148,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve weights/4b \
   --generation-config vllm
 ```
 
-For the 9B checkpoint, replace `weights/4b` and `code-as-world-4b` with
-`weights/9b` and `code-as-world-9b`.
+For the 9B checkpoint, replace `weights/9b` and `code-as-world-9b` as needed.
 
 ### Video-driven abstraction example
 
@@ -164,4 +192,3 @@ If you find Code-as-World useful, please cite:
   year    = {2026}
 }
 ```
-
