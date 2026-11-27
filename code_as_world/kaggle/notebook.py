@@ -78,6 +78,23 @@ def show_result(SUMMARY):
         path = run / name
         if path.is_file():
             print(f"\n{name}\n{path.read_text(encoding='utf-8')}")
+    if SUMMARY["status"] in {"ERROR", "FAIL", "PARTIAL"}:
+        for pattern in (
+            "preflight/*/shards/*/worker.json",
+            "preflight/*/shards/*/worker_exception.txt",
+            "preflight/*/shards/*/worker.log",
+            "shards/*/worker.json",
+            "shards/*/worker_exception.txt",
+            "shards/*/worker.log",
+            "preflight/*/samples/*/attempt-*/exception.txt",
+            "samples/*/attempt-*/exception.txt",
+        ):
+            for extra in sorted(run.glob(pattern)):
+                rel = extra.relative_to(run).as_posix()
+                text = extra.read_text(encoding="utf-8", errors="replace")
+                if extra.name == "worker.json" and '"worker_error"' not in text:
+                    continue
+                print(f"\n{rel}\n{text[-4000:]}")
 
     predictions = run / "predictions.csv"
     if predictions.is_file():

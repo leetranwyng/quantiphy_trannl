@@ -18,3 +18,5 @@ data/
 *.ckpt
 *.safetensors
 *.bin
+*.tar
+*.bundle

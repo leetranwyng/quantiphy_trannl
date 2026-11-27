@@ -80,6 +80,23 @@ def peaks(reset=False):
     return values
 
 
+def resolve_device_map(model):
+    hf_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_map, dict) and hf_map:
+        return {k: str(v) for k, v in hf_map.items()}
+    by_module = {}
+    for name, module in model.named_modules():
+        devices = sorted({str(p.device) for p in module.parameters(recurse=False)})
+        if len(devices) == 1:
+            by_module[name or "<root>"] = devices[0]
+        elif len(devices) > 1:
+            by_module[name or "<root>"] = devices
+    unique = {v for v in by_module.values() if isinstance(v, str)}
+    if len(unique) == 1 and all(isinstance(v, str) for v in by_module.values()):
+        return {"": next(iter(unique))}
+    return by_module
+
+
 class Trace:
     def __init__(self, run, folder, spec, worker, deep):
         self.run, self.folder, self.spec, self.worker, self.deep = run, folder, spec, worker, deep
@@ -217,7 +234,7 @@ def observed_video(run, record):
         def get_batch(self, indices):
             frames = super().get_batch(indices)
             try:
-                pts.append({"indices": list(indices), "seconds": self.get_frame_timestamp(indices).tolist()})
+                pts.append({"indices": [int(i) for i in indices], "seconds": self.get_frame_timestamp(indices).tolist()})
             except (RuntimeError, AttributeError, TypeError, ValueError):
                 pass
             return frames
@@ -430,7 +447,7 @@ def run_sample(root, spec, options, model, tokenizer, processor, template, video
     except Exception as exc:
         result.update(
             status="error", stage=trace.stage, error_type=type(exc).__name__,
-            oom=isinstance(exc, torch.OutOfMemoryError) or "cuda out of memory" in str(exc).lower(),
+            oom=isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower(),
         )
         trace.save("exception.txt", traceback.format_exc(), plain=True)
         trace.event(trace.stage, "error", error_type=type(exc).__name__, output_refs=["exception.txt"])
@@ -482,7 +499,7 @@ def run_worker(options):
         tokenizer, processor = upstream._load_model_tools(model_path)
         template = Template(upstream.FORMAT_PROMPT.read_text(encoding="utf-8").strip())
         use_split = required == 2
-        load_options = {"device_map": "balanced" if use_split else {"": 0}}
+        load_options = {"device_map": "balanced" if use_split else {"": "cuda:0"}}
         if use_split:
             load_options["max_memory"] = {i: min(12 * 1024**3, torch.cuda.mem_get_info(i)[0] - 3 * 1024**3)
                                           for i in range(count)}
@@ -491,8 +508,10 @@ def run_worker(options):
         model = AutoModelForImageTextToText.from_pretrained(
             str(model_path), dtype=torch.float16, attn_implementation="eager", local_files_only=True, **load_options,
         ).eval()
+        if not use_split and not all(p.is_cuda for p in model.parameters()):
+            model = model.to("cuda:0")
         synchronize()
-        device_map = {k: str(v) for k, v in model.hf_device_map.items()}
+        device_map = resolve_device_map(model)
         realized = {p.device.index for p in model.parameters() if p.is_cuda}
         require(realized == set(range(required)) and all(p.is_cuda for p in model.parameters()),
                 f"Model placement must use the assigned GPUs without CPU offload: {device_map}")
@@ -518,7 +537,7 @@ def run_worker(options):
                     break
     except Exception as exc:
         report.update(worker_error=type(exc).__name__, oom=isinstance(exc, torch.OutOfMemoryError)
-                      or "cuda out of memory" in str(exc).lower())
+                      or "out of memory" in str(exc).lower())
         write_text(worker_output / "worker_exception.txt", traceback.format_exc())
     write_json(worker_output / "worker.json", report)
 
