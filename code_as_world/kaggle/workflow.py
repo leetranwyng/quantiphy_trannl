@@ -278,12 +278,14 @@ def short_fixture(run, spec):
     path = run / "videos" / "sanity_short_fixture.mp4"
     run_command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i",
                 str(run / spec["video"]["path"]), "-an", "-frames:v", "8", "-c:v", "mpeg4", str(path))
+    video = {
+        **reference(run, path), "probe": video_probe(path), "derived_from": spec["video"]["path"],
+        "purpose": "Exercise the upstream short-clip retry below 16 source frames.",
+    }
     return {
         **spec, "id": spec["id"] + "-short-fixture",
-        "video": {
-            **reference(run, path), "probe": video_probe(path), "derived_from": spec["video"]["path"],
-            "purpose": "Exercise the upstream short-clip retry below 16 source frames.",
-        },
+        "record": {**spec["record"], "video_id": "sanity_short_fixture", "video": video["path"]},
+        "video": video,
     }
 
 

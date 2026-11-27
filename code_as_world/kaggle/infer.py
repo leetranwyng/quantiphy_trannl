@@ -423,7 +423,7 @@ def run_sample(root, spec, options, model, tokenizer, processor, template, video
         trace.end("prompt", output_refs=["messages.json", "rendered_prompt.txt"])
         trace.begin("fetch_video", input_refs=["source_video"])
         trace.add("source_video", spec["video"])
-        cache_key = (spec["record"]["video_id"], spec["record"]["fps"])
+        cache_key = (spec["video"]["path"], spec["video"]["sha256"], spec["record"]["fps"])
         cache_hit = cache_key in video_cache
         if not cache_hit:
             record = {**spec["record"], "video": str(run / spec["video"]["path"])}
