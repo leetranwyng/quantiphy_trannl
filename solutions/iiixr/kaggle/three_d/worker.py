@@ -138,7 +138,14 @@ out.reset_index()[OUT_COLS].to_csv(f"{R}/preds/{SPLIT}_{PFX}_d_vw.csv", index=Fa
                 lines.insert(ix, pad + 'trace.arrays("sam2_output", dict(locals(), j=int(o.frame_idx)), logits=o.pred_masks, scores=o.object_score_logits)')
         source = "\n".join(lines) + "\n"
     if name == "geo/sa2va_track.py":
-        source = replace_once(source, "        last = torch.cat(", '        trace.log("sa2va_generation", locals(), prompt=text, response=pred, key_frames=key_idx, artifact=trace.blob(**dict(mm)))\n        last = torch.cat(')
+        source = replace_once(
+            source,
+            "        last = torch.cat(",
+            '        trace.log("sa2va_generation", locals(), prompt=text, response=pred, key_frames=key_idx, '
+            'artifact=trace.blob(**{k: v for k, v in mm.items() if k != "pixel_values"}), '
+            'media_artifact=trace.blob(pixel_values=mm["pixel_values"]) if "pixel_values" in mm else None)\n'
+            "        last = torch.cat(",
+        )
         source = replace_once(source, "            st.append(tc.mask_stats(m))",
                               '            trace.arrays("sa2va_mask", locals(), mask=np.packbits(m, axis=1), dimensions=m.shape)\n            st.append(tc.mask_stats(m))')
     if name.startswith("geo/"):

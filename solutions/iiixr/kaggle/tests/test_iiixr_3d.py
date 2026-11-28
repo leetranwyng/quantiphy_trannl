@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from solutions.iiixr.kaggle.schema import read_json, write_json_atomic
-from solutions.iiixr.kaggle.three_d import data, report, worker, workflow
+import numpy as np
+
+from solutions.iiixr.kaggle.schema import REPO_ROOT, read_json, write_json_atomic
+from solutions.iiixr.kaggle.three_d import data, report, trace, verify, worker, workflow
 
 
 class ThreeDTests(unittest.TestCase):
@@ -123,6 +129,155 @@ class ThreeDTests(unittest.TestCase):
         checkpoint.write_bytes(checkpoint.read_bytes()[:40])
         with self.assertRaisesRegex(Exception, "zip file"):
             workflow.extract_run(checkpoint, self.root / "bad")
+
+    def test_qwen_video_metadata_sanitization_and_media_dedup(self):
+        import torch
+        from transformers.feature_extraction_utils import BatchFeature
+        from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        trace_dir = self.root / "qwen_trace"
+        trace_dir.mkdir(parents=True)
+        video_proc = Qwen3VLVideoProcessor()
+
+        class RealVideoProcWrapper:
+            def __call__(self, *, text, videos=None, video_metadata=None, do_sample_frames=None, **kwargs):
+                # Exercises actual transformers 5.x Qwen3VLVideoProcessor -> make_batched_metadata -> VideoMetadata
+                vid_out = video_proc(
+                    videos=videos,
+                    video_metadata=video_metadata,
+                    do_sample_frames=do_sample_frames,
+                    return_tensors="pt",
+                )
+                tok_len = 8 + len(text[0]) % 5
+                return BatchFeature(
+                    data={
+                        "input_ids": torch.arange(tok_len, dtype=torch.long).unsqueeze(0),
+                        "attention_mask": torch.ones((1, tok_len), dtype=torch.long),
+                        **vid_out,
+                    },
+                    tensor_type="pt",
+                )
+
+            def decode(self, ids, skip_special_tokens=True):
+                return "2.5 m"
+
+        class DummyModel:
+            device = torch.device("cpu")
+
+            def generate(self, **kwargs):
+                inp = kwargs["input_ids"]
+                extra = torch.tensor([[42, 43]], dtype=torch.long)
+                return torch.cat([inp, extra], dim=1)
+
+        qwen = trace.Qwen.__new__(trace.Qwen)
+        qwen.config = {}
+        qwen._video_blob_cache = {}
+        qwen.processor = RealVideoProcWrapper()
+        qwen.model = DummyModel()
+
+        frames = np.zeros((4, 240, 320, 3), dtype=np.uint8)
+        # Exact metadata dict shape produced by upstream/tools/run_vlm.py (includes 'do_sample_frames': False)
+        vllm_meta = {
+            "fps": 24.0,
+            "duration": 2.0,
+            "total_num_frames": 48,
+            "frames_indices": [0, 12, 24, 36],
+            "video_backend": "opencv",
+            "do_sample_frames": False,
+        }
+        reqs = [
+            {
+                "prompt": "Question 1 about video",
+                "multi_modal_data": {"video": [(frames, vllm_meta)]},
+                "trace_context": {"question_id": 1001, "video_id": "captured_0027s"},
+            },
+            {
+                "prompt": "Different question 2 about the very same video",
+                "multi_modal_data": {"video": [(frames, vllm_meta)]},
+                "trace_context": {"question_id": 1002, "video_id": "captured_0027s"},
+            },
+        ]
+        sp = trace.SamplingParams(temperature=0.0, max_tokens=16)
+        with patch.dict(os.environ, {"IIIXR_TRACE_DIR": str(trace_dir), "IIIXR_STAGE_EVENT": "evt-qwen-test"}):
+            outs = qwen.generate(reqs, sp)
+
+        self.assertEqual([o.outputs[0].text for o in outs], ["2.5 m", "2.5 m"])
+        calls = [json.loads(ln) for ln in (trace_dir / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 2)
+        # Different prompts produce distinct token input artifacts, but share 1 deduplicated video pixel artifact
+        self.assertNotEqual(calls[0]["artifact"], calls[1]["artifact"])
+        self.assertIsNotNone(calls[0]["media_artifact"])
+        self.assertEqual(calls[0]["media_artifact"], calls[1]["media_artifact"])
+        npz_files = list((trace_dir / "arrays").glob("*.npz"))
+        self.assertEqual(len(npz_files), 3)  # 2 small token blobs + 1 shared video pixel blob
+
+    def test_spaced_captured_0041x_staging_fail_fast_and_full_3d_replay(self):
+        caw_tar = REPO_ROOT / "quantiphy_full.tar"
+        self.assertTrue(caw_tar.is_file(), "quantiphy_full.tar required for clip staging test")
+
+        # Extract real captured_0041x.mp4 from quantiphy_full.tar to simulate HuggingFace spaced filename
+        real_mp4 = self.root / "real_0041x.mp4"
+        with tarfile.open(caw_tar) as archive:
+            real_mp4.write_bytes(archive.extractfile("run/videos/captured_0041x.mp4").read())
+
+        inputs, _, _ = data.resolve_inputs(None, self.root / "cache", False)
+        q_0041x = [r for r in inputs.values() if r["video_id"] == "captured_0041x"]
+        self.assertGreaterEqual(len(q_0041x), 1)
+
+        # 1. Simulate Hugging Face returning 404 on 'validation_videos/captured_0041x.mp4'
+        #    and succeeding on 'validation_videos/ captured_0041x.mp4'
+        calls_seen = []
+
+        def fake_hf_download(repo_id, filename, **kwargs):
+            calls_seen.append(filename)
+            if filename == "validation_videos/captured_0041x.mp4":
+                raise RuntimeError("404 Client Error: Entry Not Found for validation_videos/captured_0041x.mp4")
+            if filename == "validation_videos/ captured_0041x.mp4":
+                return str(real_mp4)
+            raise AssertionError(f"Unexpected HF filename: {filename}")
+
+        with patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_download):
+            staged = data.stage_videos(q_0041x, self.root / "videos_hf", None, self.root / "cache", None, True)
+
+        self.assertEqual(
+            calls_seen,
+            ["validation_videos/captured_0041x.mp4", "validation_videos/ captured_0041x.mp4"],
+        )
+        self.assertEqual(staged["captured_0041x"]["status"], "ok")
+        self.assertEqual(staged["captured_0041x"]["path"], "videos/captured_0041x.mp4")
+        self.assertEqual(
+            staged["captured_0041x"]["sha256"],
+            "f096debad0a8cabda4addbd216c22fc4d0a5c487417a4807149b6b13cf75b29c",
+        )
+
+        # 2. Verify fail-fast in fresh mode BEFORE launching GPU preflight/workers when clips are missing
+        with patch.object(workflow, "predictions_from_fresh") as mock_fresh:
+            with self.assertRaisesRegex(RuntimeError, "Validation clips unavailable"):
+                workflow.main([
+                    "--scope", "sanity",
+                    "--mode", "fresh",
+                    "--output", str(self.root / "fail_fast_out"),
+                    "--cache", str(self.root / "cache"),
+                ])
+            mock_fresh.assert_not_called()
+
+        # 3. Verify full 90-question 3D replay with all 12 real videos (including captured_0041x) + verify.check()
+        replay_out = self.root / "full_3d_replay"
+        workflow.main([
+            "--scope", "full",
+            "--mode", "replay",
+            "--caw-tar", str(caw_tar),
+            "--output", str(replay_out),
+            "--cache", str(self.root / "cache"),
+        ])
+        chk = verify.check(replay_out / "run")
+        self.assertEqual(chk["questions"], 90)
+        ev = read_json(replay_out / "run/evaluation.json")
+        self.assertEqual(ev["all"]["n"], 90)
+        self.assertEqual(ev["all"]["covered"], 90)
+        self.assertAlmostEqual(ev["all"]["mra"], 0.6488888888888888, places=6)
+        qs_manifest = read_json(replay_out / "run/questions.json")
+        self.assertTrue(all(q["clip"]["status"] == "ok" for q in qs_manifest))
 
 
 if __name__ == "__main__":

@@ -384,6 +384,13 @@ def main(argv=None):
         return
     selected, processing = choose(inputs, args)
     clips = data.stage_videos(processing, run / "videos", args.dataset_dir, args.cache, args.caw_tar, args.download)
+    if args.mode == "fresh" or args.download:
+        failed_clips = {vid: clip.get("error") for vid, clip in clips.items() if clip.get("status") != "ok"}
+        if failed_clips:
+            raise RuntimeError(
+                f"Validation clips unavailable ({len(failed_clips)}/{len(clips)} failed). "
+                f"Check Kaggle Internet or dataset inputs: {failed_clips}"
+            )
     env = environment(run, args.mode == "fresh", args.allow_other_gpu)
     write_json_atomic(run / "environment.json", env)
     source = run / "source"

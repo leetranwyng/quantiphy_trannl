@@ -128,7 +128,9 @@ def stage_videos(questions, destination, dataset_dir, cache, caw_tar, download):
     if dataset_dir:
         for video in sorted(candidates):
             path = next((p for p in (dataset_dir / "validation_videos" / f"{video}.mp4",
-                                     dataset_dir / f"{video}.mp4") if p.is_file()), None)
+                                     dataset_dir / "validation_videos" / f" {video}.mp4",
+                                     dataset_dir / f"{video}.mp4",
+                                     dataset_dir / f" {video}.mp4") if p.is_file()), None)
             if path:
                 sources[video] = (path, "dataset_mount")
     errors = {}
@@ -136,18 +138,26 @@ def stage_videos(questions, destination, dataset_dir, cache, caw_tar, download):
         from huggingface_hub import hf_hub_download
 
         for video in sorted(candidates - sources.keys()):
-            try:
-                path = hf_hub_download(DATASET, f"validation_videos/{video}.mp4", repo_type="dataset",
-                                       revision=REVISION, cache_dir=cache)
-                sources[video] = (Path(path), f"{DATASET}@{REVISION}")
-            except Exception as exc:
-                errors[video] = str(exc)
+            # Note: PaulineLi/QuantiPhy-validation stores captured_0041x with a leading space
+            # ("validation_videos/ captured_0041x.mp4"); try canonical path first, then spaced fallback.
+            last_exc = None
+            for hf_rel in (f"validation_videos/{video}.mp4", f"validation_videos/ {video}.mp4"):
+                try:
+                    path = hf_hub_download(DATASET, hf_rel, repo_type="dataset",
+                                           revision=REVISION, cache_dir=cache)
+                    sources[video] = (Path(path), f"{DATASET}@{REVISION}:{hf_rel}")
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                errors[video] = str(last_exc)
     if caw_tar and candidates - sources.keys():
         with tarfile.open(caw_tar) as archive:
             available = {m.name: m for m in archive if m.isfile()}
             for video in sorted(candidates - sources.keys()):
-                member = f"run/videos/{video}.mp4"
-                if member in available:
+                member = next((m for m in (f"run/videos/{video}.mp4", f"run/videos/ {video}.mp4") if m in available), None)
+                if member:
                     path = destination / f"{video}.mp4"
                     with archive.extractfile(available[member]) as src, path.open("wb") as out:
                         shutil.copyfileobj(src, out)
